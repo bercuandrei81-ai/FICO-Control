@@ -687,10 +687,10 @@ h1{{font-size:31px;margin:22px 0 8px}}
 label{{display:block;margin:20px 0 8px;font-weight:700}}
 input,button{{width:100%;padding:14px;border-radius:11px;border:1px solid #d8dde3;font-size:16px}}
 input[type=file]{{background:#fff}}
-.proof-input{{position:absolute;width:1px;height:1px;opacity:0;pointer-events:none}}
-.proof-actions{{display:grid;grid-template-columns:1fr 1fr;gap:10px}}
-.proof-action{{width:100%;padding:14px 12px;border-radius:11px;border:1px solid #d8dde3;background:#fff;color:#17212b;font-size:15px;font-weight:800;cursor:pointer}}
+.proof-input-native{{position:absolute;left:-9999px;width:1px;height:1px;opacity:0}}
+.proof-action{{display:block;width:100%;box-sizing:border-box;padding:14px 12px;border-radius:11px;border:1px solid #d8dde3;background:#fff;color:#17212b;font-size:15px;font-weight:800;cursor:pointer;text-align:center}}
 .proof-action.primary{{background:#17212b;color:#fff;border-color:#17212b}}
+.camera-label{{margin-top:2px}}
 .proof-selected{{display:none;margin-top:10px;padding:10px 12px;border-radius:9px;background:#eaf7ef;color:#146c43;font-size:13px;font-weight:700;word-break:break-word}}
 .proof-selected.show{{display:block}}
 .submit{{margin-top:22px;background:#17212b;color:#fff;border:0;font-weight:800;cursor:pointer}}
@@ -703,7 +703,6 @@ input[type=file]{{background:#fff}}
   .topbar{{align-items:flex-start}}
   .brand{{font-size:12px}}
   .lang-btn{{padding:7px}}
-  .proof-actions{{grid-template-columns:1fr}}
 }}
 </style>
 </head>
@@ -730,35 +729,18 @@ input[type=file]{{background:#fff}}
 
 <label data-i18n="photoLabel">1. Poză / Screenshot FICO</label>
 
+<label class="proof-action primary camera-label" for="proof" data-i18n="takePhoto">Fă o poză acum</label>
 <input
   id="proof"
-  class="proof-input"
+  class="proof-input-native"
   type="file"
   name="proof"
   accept="image/*"
+  capture="environment"
   required
 >
-
-<div class="proof-actions">
-  <button
-    id="cameraButton"
-    class="proof-action primary"
-    type="button"
-    data-i18n="takePhoto"
-    onclick="chooseProofSource('camera')"
-  >Fă o poză acum</button>
-
-  <button
-    id="galleryButton"
-    class="proof-action"
-    type="button"
-    data-i18n="chooseGallery"
-    onclick="chooseProofSource('gallery')"
-  >Alege din galerie</button>
-</div>
-
 <div id="proofSelected" class="proof-selected"></div>
-<div class="hint" data-i18n="photoHint">Fă o poză acum sau alege un screenshot din galerie · maximum 10 MB</div>
+<div class="hint" data-i18n="photoHint">Fă o poză clară în care scorul FICO este vizibil · maximum 10 MB</div>
 
 <label data-i18n="nameLabel">2. Numele complet</label>
 <input id="fullName" type="text" name="full_name" autocomplete="name" placeholder="Prenume și nume complet" required>
@@ -778,9 +760,8 @@ const translations = {{
     intro: "Încarcă o poză sau un screenshot clar în care scorul FICO este vizibil.",
     photoLabel: "1. Poză / Screenshot FICO",
     takePhoto: "Fă o poză acum",
-    chooseGallery: "Alege din galerie",
     photoSelected: "Poză selectată:",
-    photoHint: "Fă o poză acum sau alege un screenshot din galerie · maximum 10 MB",
+    photoHint: "Fă o poză clară în care scorul FICO este vizibil · maximum 10 MB",
     nameLabel: "2. Numele complet",
     nameHint: "Scrie numele exact așa cum apare în lista de lucru.",
     namePlaceholder: "Prenume și nume complet",
@@ -802,9 +783,8 @@ const translations = {{
     intro: "Lade ein klares Foto oder einen Screenshot hoch, auf dem der FICO-Score sichtbar ist.",
     photoLabel: "1. FICO Foto / Screenshot",
     takePhoto: "Jetzt Foto aufnehmen",
-    chooseGallery: "Aus Galerie wählen",
     photoSelected: "Ausgewähltes Bild:",
-    photoHint: "Jetzt ein Foto aufnehmen oder einen Screenshot aus der Galerie wählen · maximal 10 MB",
+    photoHint: "Nimm ein klares Foto auf, auf dem der FICO-Score sichtbar ist · maximal 10 MB",
     nameLabel: "2. Vollständiger Name",
     nameHint: "Schreibe deinen Namen genau so, wie er in der Fahrer-/Arbeitsliste steht.",
     namePlaceholder: "Vor- und Nachname",
@@ -826,9 +806,8 @@ const translations = {{
     intro: "Upload a clear photo or screenshot where the FICO score is visible.",
     photoLabel: "1. FICO Photo / Screenshot",
     takePhoto: "Take a photo now",
-    chooseGallery: "Choose from gallery",
     photoSelected: "Selected image:",
-    photoHint: "Take a photo now or choose a screenshot from the gallery · maximum 10 MB",
+    photoHint: "Take a clear photo where the FICO score is visible · maximum 10 MB",
     nameLabel: "2. Full Name",
     nameHint: "Enter your name exactly as it appears on the driver/work list.",
     namePlaceholder: "First and last name",
@@ -847,23 +826,6 @@ const translations = {{
   }}
 }};
 
-
-function chooseProofSource(source) {{
-  const input = document.getElementById("proof");
-
-  // Reset the value so selecting/taking the same image again still fires "change".
-  input.value = "";
-
-  if (source === "camera") {{
-    // Android/iPhone browsers and WebViews interpret this as rear camera capture.
-    input.setAttribute("capture", "environment");
-  }} else {{
-    // Without capture, the normal photo/file picker is opened.
-    input.removeAttribute("capture");
-  }}
-
-  input.click();
-}}
 
 function updateSelectedProof() {{
   const input = document.getElementById("proof");
