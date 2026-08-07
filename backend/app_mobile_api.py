@@ -1,5 +1,5 @@
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse, FileResponse
 from pydantic import BaseModel
 from datetime import date, datetime
 import sqlite3
@@ -7,8 +7,16 @@ import io
 import csv
 import html
 import openpyxl
+import os
+import uuid
+import unicodedata
 
 DB = "fico.db"
+UPLOAD_DIR = "uploads"
+MAX_IMAGE_BYTES = 10 * 1024 * 1024
+ALLOWED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/webp"}
+
+os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 app = FastAPI(title="FICO Control")
 
@@ -17,6 +25,15 @@ def db():
     conn = sqlite3.connect(DB)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def ensure_column(conn, table, column, definition):
+    columns = {
+        row["name"]
+        for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+    }
+    if column not in columns:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
 
 def init_db():
@@ -46,11 +63,66 @@ def init_db():
         FOREIGN KEY(driver_id) REFERENCES drivers(id)
     );
     """)
+
+    ensure_column(conn, "submissions", "entered_full_name", "TEXT")
+    ensure_column(conn, "submissions", "proof_filename", "TEXT")
+    ensure_column(conn, "submissions", "proof_original_name", "TEXT")
+
     conn.commit()
     conn.close()
 
 
 init_db()
+
+
+def normalize_name(value: str) -> str:
+    value = unicodedata.normalize("NFKC", value or "")
+    value = " ".join(value.strip().split())
+    return value.casefold()
+
+
+def find_required_driver(conn, work_date: str, entered_name: str):
+    target = normalize_name(entered_name)
+
+    rows = conn.execute("""
+        SELECT d.id, d.name
+        FROM daily_required r
+        JOIN drivers d ON d.id = r.driver_id
+        WHERE r.work_date = ?
+    """, (work_date,)).fetchall()
+
+    for row in rows:
+        if normalize_name(row["name"]) == target:
+            return row
+
+    return None
+
+
+async def save_proof_image(proof: UploadFile) -> tuple[str, str]:
+    if proof.content_type not in ALLOWED_IMAGE_TYPES:
+        raise HTTPException(status_code=400, detail="invalid_image_type")
+
+    raw = await proof.read()
+
+    if not raw:
+        raise HTTPException(status_code=400, detail="empty_image")
+
+    if len(raw) > MAX_IMAGE_BYTES:
+        raise HTTPException(status_code=400, detail="image_too_large")
+
+    extension = {
+        "image/jpeg": ".jpg",
+        "image/png": ".png",
+        "image/webp": ".webp"
+    }[proof.content_type]
+
+    filename = f"{uuid.uuid4().hex}{extension}"
+    path = os.path.join(UPLOAD_DIR, filename)
+
+    with open(path, "wb") as f:
+        f.write(raw)
+
+    return filename, (proof.filename or "proof")
 
 
 class SubmissionIn(BaseModel):
@@ -84,8 +156,9 @@ def drivers_today():
     }
 
 
+# Kept temporarily for compatibility with the existing mobile prototype.
 @app.post("/api/submissions")
-def submit_mobile(payload: SubmissionIn):
+def submit_mobile_legacy(payload: SubmissionIn):
     if payload.fico_score < 0 or payload.fico_score > 1000:
         raise HTTPException(status_code=400, detail="invalid_score")
 
@@ -111,8 +184,9 @@ def submit_mobile(payload: SubmissionIn):
         raise HTTPException(status_code=409, detail="already_sent")
 
     conn.execute("""
-        INSERT INTO submissions(work_date, driver_id, fico_score, submitted_at)
-        VALUES(?,?,?,?)
+        INSERT INTO submissions(
+            work_date, driver_id, fico_score, submitted_at
+        ) VALUES(?,?,?,?)
     """, (
         today,
         payload.driver_id,
@@ -122,8 +196,66 @@ def submit_mobile(payload: SubmissionIn):
 
     conn.commit()
     conn.close()
-
     return {"ok": True}
+
+
+@app.post("/api/submissions/photo")
+async def submit_mobile_photo(
+    full_name: str = Form(...),
+    fico_score: int = Form(...),
+    proof: UploadFile = File(...)
+):
+    if fico_score < 0 or fico_score > 1000:
+        raise HTTPException(status_code=400, detail="invalid_score")
+
+    today = date.today().isoformat()
+    conn = db()
+
+    driver = find_required_driver(conn, today, full_name)
+
+    if not driver:
+        conn.close()
+        raise HTTPException(status_code=400, detail="driver_not_found_today")
+
+    existing = conn.execute(
+        "SELECT 1 FROM submissions WHERE work_date=? AND driver_id=?",
+        (today, driver["id"])
+    ).fetchone()
+
+    if existing:
+        conn.close()
+        raise HTTPException(status_code=409, detail="already_sent")
+
+    try:
+        filename, original_name = await save_proof_image(proof)
+    except Exception:
+        conn.close()
+        raise
+
+    conn.execute("""
+        INSERT INTO submissions(
+            work_date,
+            driver_id,
+            fico_score,
+            submitted_at,
+            entered_full_name,
+            proof_filename,
+            proof_original_name
+        ) VALUES(?,?,?,?,?,?,?)
+    """, (
+        today,
+        driver["id"],
+        fico_score,
+        datetime.now().isoformat(timespec="seconds"),
+        " ".join(full_name.strip().split()),
+        filename,
+        original_name
+    ))
+
+    conn.commit()
+    conn.close()
+
+    return {"ok": True, "driver": driver["name"]}
 
 
 def extract_driver_names_from_xlsx(raw: bytes) -> list[str]:
@@ -133,11 +265,7 @@ def extract_driver_names_from_xlsx(raw: bytes) -> list[str]:
         data_only=True
     )
 
-    if "Strecken" in workbook.sheetnames:
-        ws = workbook["Strecken"]
-    else:
-        ws = workbook[workbook.sheetnames[0]]
-
+    ws = workbook["Strecken"] if "Strecken" in workbook.sheetnames else workbook[workbook.sheetnames[0]]
     rows = ws.iter_rows(values_only=True)
     headers = next(rows, None)
 
@@ -162,7 +290,6 @@ def extract_driver_names_from_xlsx(raw: bytes) -> list[str]:
     ]
 
     name_index = None
-
     for candidate in candidates:
         if candidate in normalized:
             name_index = normalized.index(candidate)
@@ -171,25 +298,17 @@ def extract_driver_names_from_xlsx(raw: bytes) -> list[str]:
     if name_index is None:
         raise ValueError("driver_column_not_found")
 
-    names = []
-    seen = set()
+    names, seen = [], set()
 
     for row in rows:
-        if name_index >= len(row):
+        if name_index >= len(row) or row[name_index] is None:
             continue
 
-        value = row[name_index]
-
-        if value is None:
-            continue
-
-        name = str(value).strip()
-
+        name = str(row[name_index]).strip()
         if not name:
             continue
 
-        key = name.casefold()
-
+        key = normalize_name(name)
         if key not in seen:
             seen.add(key)
             names.append(name)
@@ -227,28 +346,13 @@ async def upload_daily_list(
         )
 
     conn = db()
-
-    conn.execute(
-        "DELETE FROM daily_required WHERE work_date=?",
-        (work_date,)
-    )
+    conn.execute("DELETE FROM daily_required WHERE work_date=?", (work_date,))
 
     for name in names:
+        conn.execute("INSERT OR IGNORE INTO drivers(name) VALUES(?)", (name,))
+        driver = conn.execute("SELECT id FROM drivers WHERE name=?", (name,)).fetchone()
         conn.execute(
-            "INSERT OR IGNORE INTO drivers(name) VALUES(?)",
-            (name,)
-        )
-
-        driver = conn.execute(
-            "SELECT id FROM drivers WHERE name=?",
-            (name,)
-        ).fetchone()
-
-        conn.execute(
-            """
-            INSERT OR IGNORE INTO daily_required(work_date, driver_id)
-            VALUES(?,?)
-            """,
+            "INSERT OR IGNORE INTO daily_required(work_date, driver_id) VALUES(?,?)",
             (work_date, driver["id"])
         )
 
@@ -262,43 +366,55 @@ async def upload_daily_list(
 
 
 @app.post("/submit")
-def submit_web(
-    driver_id: int = Form(...),
-    fico_score: int = Form(...)
+async def submit_web(
+    full_name: str = Form(...),
+    fico_score: int = Form(...),
+    proof: UploadFile = File(...)
 ):
-    today = date.today().isoformat()
-
     if fico_score < 0 or fico_score > 1000:
         return RedirectResponse("/?error=invalid_score", status_code=303)
 
+    today = date.today().isoformat()
     conn = db()
+    driver = find_required_driver(conn, today, full_name)
 
-    required = conn.execute(
-        "SELECT 1 FROM daily_required WHERE work_date=? AND driver_id=?",
-        (today, driver_id)
-    ).fetchone()
-
-    if not required:
+    if not driver:
         conn.close()
-        return RedirectResponse("/?error=not_required", status_code=303)
+        return RedirectResponse("/?error=name_not_found", status_code=303)
 
     existing = conn.execute(
         "SELECT 1 FROM submissions WHERE work_date=? AND driver_id=?",
-        (today, driver_id)
+        (today, driver["id"])
     ).fetchone()
 
     if existing:
         conn.close()
         return RedirectResponse("/?error=already_sent", status_code=303)
 
+    try:
+        filename, original_name = await save_proof_image(proof)
+    except HTTPException as exc:
+        conn.close()
+        return RedirectResponse(f"/?error={exc.detail}", status_code=303)
+
     conn.execute("""
-        INSERT INTO submissions(work_date, driver_id, fico_score, submitted_at)
-        VALUES(?,?,?,?)
+        INSERT INTO submissions(
+            work_date,
+            driver_id,
+            fico_score,
+            submitted_at,
+            entered_full_name,
+            proof_filename,
+            proof_original_name
+        ) VALUES(?,?,?,?,?,?,?)
     """, (
         today,
-        driver_id,
+        driver["id"],
         fico_score,
-        datetime.now().isoformat(timespec="seconds")
+        datetime.now().isoformat(timespec="seconds"),
+        " ".join(full_name.strip().split()),
+        filename,
+        original_name
     ))
 
     conn.commit()
@@ -307,28 +423,21 @@ def submit_web(
     return RedirectResponse("/?success=1", status_code=303)
 
 
+@app.get("/proof/{filename}")
+def proof_image(filename: str):
+    # Prevent path traversal.
+    safe_name = os.path.basename(filename)
+    path = os.path.join(UPLOAD_DIR, safe_name)
+
+    if not os.path.isfile(path):
+        raise HTTPException(status_code=404, detail="proof_not_found")
+
+    return FileResponse(path)
+
+
 @app.get("/", response_class=HTMLResponse)
 def driver_page():
     today = date.today().isoformat()
-    conn = db()
-
-    drivers = conn.execute("""
-        SELECT d.id, d.name
-        FROM daily_required r
-        JOIN drivers d ON d.id = r.driver_id
-        WHERE r.work_date = ?
-        ORDER BY d.name
-    """, (today,)).fetchall()
-
-    conn.close()
-
-    options = '<option value="">Selectează numele</option>'
-
-    for d in drivers:
-        options += (
-            f'<option value="{d["id"]}">'
-            f'{html.escape(d["name"])}</option>'
-        )
 
     page = f"""
 <!doctype html>
@@ -340,26 +449,37 @@ def driver_page():
 <style>
 *{{box-sizing:border-box}}
 body{{margin:0;font-family:Arial,sans-serif;background:#f4f6f8;color:#17212b}}
-.card{{width:min(92%,470px);margin:55px auto;background:#fff;padding:30px;border-radius:20px;box-shadow:0 12px 35px rgba(0,0,0,.08)}}
+.card{{width:min(92%,500px);margin:45px auto;background:#fff;padding:30px;border-radius:20px;box-shadow:0 12px 35px rgba(0,0,0,.08)}}
 .brand{{font-size:13px;font-weight:800;letter-spacing:2px}}
-h1{{font-size:32px;margin:22px 0 8px}}
-.muted{{color:#667085}}
+h1{{font-size:31px;margin:22px 0 8px}}
+.muted{{color:#667085;line-height:1.45}}
 label{{display:block;margin:20px 0 8px;font-weight:700}}
-input,select,button{{width:100%;padding:14px;border-radius:11px;border:1px solid #d8dde3;font-size:16px}}
-button{{margin-top:20px;background:#17212b;color:#fff;border:0;font-weight:800;cursor:pointer}}
+input,button{{width:100%;padding:14px;border-radius:11px;border:1px solid #d8dde3;font-size:16px}}
+input[type=file]{{background:#fff}}
+button{{margin-top:22px;background:#17212b;color:#fff;border:0;font-weight:800;cursor:pointer}}
+.hint{{font-size:13px;color:#667085;margin-top:7px}}
 </style>
 </head>
 <body>
 <main class="card">
 <div class="brand">FICO CONTROL</div>
 <h1>Trimite scorul FICO</h1>
-<p class="muted">{today}</p>
-<form action="/submit" method="post">
-<label>Numele șoferului</label>
-<select name="driver_id" required>{options}</select>
-<label>Scor FICO</label>
-<input type="number" name="fico_score" min="0" max="1000" placeholder="ex. 850" required>
-<button type="submit">Trimite scorul</button>
+<p class="muted">{today}<br>Încarcă o poză sau un screenshot clar în care scorul FICO este vizibil.</p>
+
+<form action="/submit" method="post" enctype="multipart/form-data">
+
+<label>1. Poză / Screenshot FICO</label>
+<input type="file" name="proof" accept="image/jpeg,image/png,image/webp" required>
+<div class="hint">JPG, PNG sau WEBP · maximum 10 MB</div>
+
+<label>2. Numele complet</label>
+<input type="text" name="full_name" autocomplete="name" placeholder="Prenume și nume complet" required>
+<div class="hint">Scrie numele exact așa cum apare în lista de lucru.</div>
+
+<label>3. Scor FICO</label>
+<input type="number" name="fico_score" min="0" max="1000" inputmode="numeric" placeholder="ex. 850" required>
+
+<button type="submit">Trimite scorul și dovada</button>
 </form>
 </main>
 </body>
@@ -377,6 +497,8 @@ def admin_page(d: str | None = None):
         SELECT d.name,
                s.fico_score,
                s.submitted_at,
+               s.entered_full_name,
+               s.proof_filename,
                CASE WHEN s.id IS NULL THEN 0 ELSE 1 END AS sent
         FROM daily_required r
         JOIN drivers d ON d.id = r.driver_id
@@ -401,12 +523,18 @@ def admin_page(d: str | None = None):
         fico = r["fico_score"] if r["fico_score"] is not None else "—"
         hour = r["submitted_at"][11:16] if r["submitted_at"] else "—"
 
+        if r["proof_filename"]:
+            proof = f'<a class="proof" href="/proof/{html.escape(r["proof_filename"])}" target="_blank">Vezi poza</a>'
+        else:
+            proof = "—"
+
         table_rows += f"""
         <tr>
             <td>{html.escape(r["name"])}</td>
             <td class="{status_class}">{status}</td>
             <td>{fico}</td>
             <td>{hour}</td>
+            <td>{proof}</td>
         </tr>
         """
 
@@ -420,7 +548,7 @@ def admin_page(d: str | None = None):
 <style>
 *{{box-sizing:border-box}}
 body{{margin:0;font-family:Arial,sans-serif;background:#f4f6f8;color:#17212b}}
-.admin{{width:min(94%,1150px);margin:35px auto}}
+.admin{{width:min(95%,1200px);margin:35px auto}}
 .brand{{font-size:13px;font-weight:800;letter-spacing:2px}}
 h1{{font-size:36px;margin:20px 0 35px}}
 .stats{{display:grid;grid-template-columns:repeat(3,1fr);gap:15px;margin-bottom:25px}}
@@ -435,6 +563,7 @@ table{{width:100%;border-collapse:collapse}}
 th,td{{text-align:left;padding:13px;border-bottom:1px solid #eceff2}}
 .sent{{color:#14804a;font-weight:800}}
 .missing{{color:#d13b2e;font-weight:800}}
+.proof{{font-weight:700;color:#17212b}}
 @media(max-width:700px){{.stats{{grid-template-columns:1fr}}.panel{{overflow-x:auto}}}}
 </style>
 </head>
@@ -470,6 +599,7 @@ th,td{{text-align:left;padding:13px;border-bottom:1px solid #eceff2}}
 <th>Status</th>
 <th>FICO</th>
 <th>Ora</th>
+<th>Dovadă</th>
 </tr>
 </thead>
 <tbody>
@@ -493,7 +623,8 @@ def export_day(d: str | None = None):
         SELECT d.name,
                CASE WHEN s.id IS NULL THEN 'Nu a trimis' ELSE 'Trimis' END AS status,
                COALESCE(s.fico_score, '') AS fico_score,
-               COALESCE(s.submitted_at, '') AS submitted_at
+               COALESCE(s.submitted_at, '') AS submitted_at,
+               COALESCE(s.proof_filename, '') AS proof_filename
         FROM daily_required r
         JOIN drivers d ON d.id = r.driver_id
         LEFT JOIN submissions s
@@ -507,14 +638,15 @@ def export_day(d: str | None = None):
 
     out = io.StringIO()
     writer = csv.writer(out)
-    writer.writerow(["Driver", "Status", "FICO", "Submitted at"])
+    writer.writerow(["Driver", "Status", "FICO", "Submitted at", "Proof"])
 
     for r in rows:
         writer.writerow([
             r["name"],
             r["status"],
             r["fico_score"],
-            r["submitted_at"]
+            r["submitted_at"],
+            r["proof_filename"]
         ])
 
     out.seek(0)
