@@ -848,38 +848,38 @@ const translations = {{
 }};
 
 
-function chooseProofSource(source) {
+function chooseProofSource(source) {{
   const input = document.getElementById("proof");
 
   // Reset the value so selecting/taking the same image again still fires "change".
   input.value = "";
 
-  if (source === "camera") {
+  if (source === "camera") {{
     // Android/iPhone browsers and WebViews interpret this as rear camera capture.
     input.setAttribute("capture", "environment");
-  } else {
+  }} else {{
     // Without capture, the normal photo/file picker is opened.
     input.removeAttribute("capture");
-  }
+  }}
 
   input.click();
-}
+}}
 
-function updateSelectedProof() {
+function updateSelectedProof() {{
   const input = document.getElementById("proof");
   const box = document.getElementById("proofSelected");
   const lang = localStorage.getItem("ficoLanguage") || detectInitialLanguage();
   const t = translations[lang] || translations.ro;
 
-  if (input.files && input.files.length > 0) {
+  if (input.files && input.files.length > 0) {{
     const name = input.files[0].name || "FICO";
-    box.textContent = `${t.photoSelected} ${name}`;
+    box.textContent = `${{t.photoSelected}} ${{name}}`;
     box.classList.add("show");
-  } else {
+  }} else {{
     box.textContent = "";
     box.classList.remove("show");
-  }
-}
+  }}
+}}
 
 document.getElementById("proof").addEventListener("change", updateSelectedProof);
 
