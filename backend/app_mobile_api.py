@@ -312,7 +312,7 @@ def extract_driver_names_from_xlsx(raw: bytes) -> list[str]:
         # Cortex can show the assigned driver followed by rescue/helper drivers
         # in the same cell, usually separated by "|" or line breaks.
         # For FICO Control, ONLY the first driver belongs to that route.
-        parts = re.split(r"[|\\n\\r]+", raw_name)
+        parts = re.split(r"[|\n\r]+", raw_name)
         name = next((part.strip() for part in parts if part.strip()), "")
 
         if not name:
