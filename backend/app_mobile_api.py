@@ -67,6 +67,21 @@ def init_db():
         UNIQUE(work_date, driver_id),
         FOREIGN KEY(driver_id) REFERENCES drivers(id)
     );
+
+    CREATE TABLE IF NOT EXISTS unresolved_submissions(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        work_date TEXT NOT NULL,
+        entered_full_name TEXT NOT NULL,
+        fico_score INTEGER NOT NULL,
+        submitted_at TEXT NOT NULL,
+        proof_filename TEXT,
+        proof_original_name TEXT,
+        detected_fico_score INTEGER,
+        verification_status TEXT,
+        best_match_name TEXT,
+        best_match_score REAL,
+        match_reason TEXT
+    );
     """)
 
     ensure_column(conn, "submissions", "entered_full_name", "TEXT")
@@ -92,6 +107,90 @@ def normalize_name(value: str) -> str:
     return value.casefold()
 
 
+def token_matches(entered_token: str, full_token: str) -> bool:
+    if not entered_token or not full_token:
+        return False
+
+    if entered_token == full_token:
+        return True
+
+    if len(entered_token) == 1:
+        return full_token.startswith(entered_token)
+
+    if len(entered_token) >= 2 and full_token.startswith(entered_token):
+        return True
+
+    if len(entered_token) >= 4:
+        return SequenceMatcher(None, entered_token, full_token).ratio() >= 0.84
+
+    return False
+
+
+def token_subsequence_score(entered_tokens: list[str], full_tokens: list[str]) -> float:
+    if not entered_tokens or not full_tokens:
+        return 0.0
+
+    matched_positions = []
+    search_from = 0
+
+    for entered_token in entered_tokens:
+        found = None
+        for idx in range(search_from, len(full_tokens)):
+            if token_matches(entered_token, full_tokens[idx]):
+                found = idx
+                break
+
+        if found is None:
+            return 0.0
+
+        matched_positions.append(found)
+        search_from = found + 1
+
+    exact = sum(
+        1
+        for entered_token, idx in zip(entered_tokens, matched_positions)
+        if entered_token == full_tokens[idx]
+    )
+    exact_ratio = exact / len(entered_tokens)
+
+    first_last_bonus = 0.0
+    if len(entered_tokens) >= 2:
+        if (
+            token_matches(entered_tokens[0], full_tokens[0])
+            and token_matches(entered_tokens[-1], full_tokens[-1])
+        ):
+            first_last_bonus = 0.06
+
+    return min(1.0, 0.88 + 0.06 * exact_ratio + first_last_bonus)
+
+
+def unordered_token_score(entered_tokens: list[str], full_tokens: list[str]) -> float:
+    if not entered_tokens or not full_tokens:
+        return 0.0
+
+    used = set()
+    exact = 0
+
+    for entered_token in entered_tokens:
+        best_idx = None
+        for idx, full_token in enumerate(full_tokens):
+            if idx in used:
+                continue
+            if token_matches(entered_token, full_token):
+                best_idx = idx
+                if entered_token == full_token:
+                    exact += 1
+                break
+
+        if best_idx is None:
+            return 0.0
+
+        used.add(best_idx)
+
+    exact_ratio = exact / len(entered_tokens)
+    return min(0.94, 0.86 + 0.08 * exact_ratio)
+
+
 def name_similarity(a: str, b: str) -> float:
     a_n = normalize_name(a)
     b_n = normalize_name(b)
@@ -99,33 +198,22 @@ def name_similarity(a: str, b: str) -> float:
     if not a_n or not b_n:
         return 0.0
 
-    # Exact / strong prefix matching gets priority.
     if a_n == b_n:
         return 1.0
 
     if b_n.startswith(a_n) or a_n.startswith(b_n):
         shorter = min(len(a_n), len(b_n))
         longer = max(len(a_n), len(b_n))
-        return 0.90 + (0.10 * shorter / max(longer, 1))
+        return 0.92 + (0.08 * shorter / max(longer, 1))
 
-    # Compare token initials and general similarity.
+    entered_tokens = a_n.split()
+    full_tokens = b_n.split()
+
+    sequence_score = token_subsequence_score(entered_tokens, full_tokens)
+    unordered_score = unordered_token_score(entered_tokens, full_tokens)
     ratio = SequenceMatcher(None, a_n, b_n).ratio()
 
-    a_tokens = a_n.split()
-    b_tokens = b_n.split()
-
-    token_score = 0.0
-    if a_tokens and b_tokens:
-        matches = 0
-        for i, token in enumerate(a_tokens):
-            if i >= len(b_tokens):
-                break
-            target = b_tokens[i]
-            if target.startswith(token) or token.startswith(target):
-                matches += 1
-        token_score = matches / max(len(a_tokens), len(b_tokens))
-
-    return max(ratio, token_score * 0.96)
+    return max(sequence_score, unordered_score, ratio * 0.90)
 
 
 def find_required_driver(conn, work_date: str, entered_name: str):
@@ -158,10 +246,13 @@ def find_required_driver(conn, work_date: str, entered_name: str):
     best_score, best_row = scored[0]
     second_score = scored[1][0] if len(scored) > 1 else 0.0
 
-    # Accept short but clear prefixes such as "Elvis V".
-    # Reject ambiguous matches when the top two are too close.
-    if best_score >= 0.82:
-        ambiguous = second_score >= 0.80 and (best_score - second_score) < 0.08
+    # Accept clear partial names such as:
+    # "Alain Sery" -> "Alain Gnebehi Kamin Sery"
+    # "Elvis V"    -> "Elvis Velcu"
+    #
+    # If two drivers match almost equally well, do not guess.
+    if best_score >= 0.84:
+        ambiguous = second_score >= 0.84 and (best_score - second_score) < 0.06
         if ambiguous:
             return None, best_score, True
         return best_row, best_score, False
@@ -373,28 +464,21 @@ async def submit_mobile_photo(
     if fico_score < 300 or fico_score > 850:
         raise HTTPException(status_code=400, detail="invalid_score")
 
+    clean_entered_name = " ".join((full_name or "").strip().split())
+    if not clean_entered_name:
+        raise HTTPException(status_code=400, detail="missing_name")
+
     today = date.today().isoformat()
     conn = db()
 
-    driver, match_score, ambiguous = find_required_driver(conn, today, full_name)
+    driver, match_score, ambiguous = find_required_driver(
+        conn,
+        today,
+        clean_entered_name
+    )
 
-    if ambiguous:
-        conn.close()
-        raise HTTPException(status_code=400, detail="ambiguous_name")
-
-    if not driver:
-        conn.close()
-        raise HTTPException(status_code=400, detail="driver_not_found_today")
-
-    existing = conn.execute(
-        "SELECT 1 FROM submissions WHERE work_date=? AND driver_id=?",
-        (today, driver["id"])
-    ).fetchone()
-
-    if existing:
-        conn.close()
-        raise HTTPException(status_code=409, detail="already_sent")
-
+    # Always receive and save the proof first. Even if the name cannot be
+    # identified safely, the submission must not be lost.
     try:
         filename, original_name, raw = await save_proof_image(proof)
     except Exception:
@@ -412,6 +496,83 @@ async def submit_mobile_photo(
         verification_status = "verified"
     else:
         verification_status = "mismatch"
+
+    # If we cannot safely identify the driver, keep the submission in a
+    # separate review queue instead of rejecting it.
+    if not driver:
+        best_match_name = None
+
+        # Find the highest candidate only as a hint for the admin.
+        candidates = conn.execute("""
+            SELECT d.name
+            FROM daily_required r
+            JOIN drivers d ON d.id = r.driver_id
+            WHERE r.work_date = ?
+            ORDER BY d.name
+        """, (today,)).fetchall()
+
+        best_hint_score = 0.0
+        for candidate in candidates:
+            candidate_score = name_similarity(
+                clean_entered_name,
+                candidate["name"]
+            )
+            if candidate_score > best_hint_score:
+                best_hint_score = candidate_score
+                best_match_name = candidate["name"]
+
+        reason = "ambiguous_name" if ambiguous else "unrecognized_name"
+
+        conn.execute("""
+            INSERT INTO unresolved_submissions(
+                work_date,
+                entered_full_name,
+                fico_score,
+                submitted_at,
+                proof_filename,
+                proof_original_name,
+                detected_fico_score,
+                verification_status,
+                best_match_name,
+                best_match_score,
+                match_reason
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
+        """, (
+            today,
+            clean_entered_name,
+            fico_score,
+            datetime.now().isoformat(timespec="seconds"),
+            filename,
+            original_name,
+            detected_score,
+            verification_status,
+            best_match_name,
+            best_hint_score,
+            reason
+        ))
+
+        conn.commit()
+        conn.close()
+
+        return {
+            "ok": True,
+            "needs_name_review": True,
+            "entered_name": clean_entered_name,
+            "best_match_name": best_match_name,
+            "best_match_score": round(best_hint_score, 3),
+            "detected_fico_score": detected_score,
+            "verification_status": verification_status,
+            "ocr_state": ocr_state
+        }
+
+    existing = conn.execute(
+        "SELECT 1 FROM submissions WHERE work_date=? AND driver_id=?",
+        (today, driver["id"])
+    ).fetchone()
+
+    if existing:
+        conn.close()
+        raise HTTPException(status_code=409, detail="already_sent")
 
     conn.execute("""
         INSERT INTO submissions(
@@ -431,7 +592,7 @@ async def submit_mobile_photo(
         driver["id"],
         fico_score,
         datetime.now().isoformat(timespec="seconds"),
-        " ".join(full_name.strip().split()),
+        clean_entered_name,
         filename,
         original_name,
         detected_score,
@@ -941,6 +1102,23 @@ def admin_page(d: str | None = None, q: str | None = None):
         ORDER BY sent ASC, d.name ASC
     """, (selected,)).fetchall()
 
+    unresolved_rows = conn.execute("""
+        SELECT id,
+               entered_full_name,
+               fico_score,
+               submitted_at,
+               proof_filename,
+               proof_original_name,
+               detected_fico_score,
+               verification_status,
+               best_match_name,
+               best_match_score,
+               match_reason
+        FROM unresolved_submissions
+        WHERE work_date = ?
+        ORDER BY submitted_at DESC
+    """, (selected,)).fetchall()
+
     conn.close()
 
     total = len(rows)
@@ -951,9 +1129,12 @@ def admin_page(d: str | None = None, q: str | None = None):
         if r["fico_score"] is not None and int(r["fico_score"]) < 800
     )
 
-    needs_review = sum(
-        1 for r in rows
-        if r["verification_status"] in ("mismatch", "manual_review")
+    needs_review = (
+        sum(
+            1 for r in rows
+            if r["verification_status"] in ("mismatch", "manual_review")
+        )
+        + len(unresolved_rows)
     )
 
     missing_names = [r["name"] for r in rows if not r["sent"]]
@@ -1039,7 +1220,95 @@ def admin_page(d: str | None = None, q: str | None = None):
         </tr>
         """
 
-    missing_js = "\n".join(missing_names).replace("\\", "\\\\").replace("`", "\\`")
+    unresolved_table = ""
+    if unresolved_rows:
+        unresolved_items = ""
+
+        for u in unresolved_rows:
+            entered = html.escape(u["entered_full_name"] or "—")
+            best_match = html.escape(u["best_match_name"] or "Nicio potrivire sigură")
+            best_score = (
+                f'{round(float(u["best_match_score"]) * 100)}%'
+                if u["best_match_score"] is not None
+                else "—"
+            )
+            fico_unresolved = (
+                u["fico_score"]
+                if u["fico_score"] is not None
+                else "—"
+            )
+            detected_unresolved = (
+                u["detected_fico_score"]
+                if u["detected_fico_score"] is not None
+                else "—"
+            )
+            unresolved_hour = (
+                u["submitted_at"][11:16]
+                if u["submitted_at"]
+                else "—"
+            )
+
+            if u["proof_filename"]:
+                unresolved_proof_url = (
+                    f'/proof/{html.escape(u["proof_filename"])}'
+                )
+                unresolved_proof = (
+                    f'<a class="proof-btn" href="{unresolved_proof_url}" '
+                    f'target="_blank">Vezi poza</a>'
+                )
+            else:
+                unresolved_proof = '<span class="dash">—</span>'
+
+            if u["verification_status"] == "mismatch":
+                fico_check = '<span class="verify-pill mismatch">⚠ FICO diferit</span>'
+            elif u["verification_status"] == "verified":
+                fico_check = '<span class="verify-pill verified">✓ FICO verificat</span>'
+            else:
+                fico_check = '<span class="verify-pill manual">? FICO manual</span>'
+
+            unresolved_items += f"""
+            <tr class="row-name-review">
+                <td>
+                    <div class="driver-name">⚠ {entered}</div>
+                    <div class="entered-name">
+                        Posibil: {best_match} · potrivire {best_score}
+                    </div>
+                </td>
+                <td><span class="verify-pill mismatch">⚠ Nume de verificat</span></td>
+                <td><strong>{fico_unresolved}</strong></td>
+                <td><strong>{detected_unresolved}</strong></td>
+                <td>{fico_check}</td>
+                <td>{unresolved_hour}</td>
+                <td>{unresolved_proof}</td>
+            </tr>
+            """
+
+        unresolved_table = f"""
+        <section class="name-review-section">
+            <div class="review-title">
+                ⚠ Trimiteri cu nume neidentificat ({len(unresolved_rows)})
+            </div>
+            <div class="review-subtitle">
+                Poza și scorul au fost salvate. Verifică manual cui aparține trimiterea.
+            </div>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Nume introdus</th>
+                        <th>Atenție</th>
+                        <th>FICO introdus</th>
+                        <th>FICO detectat</th>
+                        <th>Verificare</th>
+                        <th>Ora</th>
+                        <th>Dovadă</th>
+                    </tr>
+                </thead>
+                <tbody>{unresolved_items}</tbody>
+            </table>
+        </section>
+        """
+
+    missing_js = "\\n".join(missing_names).replace("\\\\", "\\\\\\\\").replace("`", "\\\\`")
 
     if filtered_rows:
         table_content = (
@@ -1099,6 +1368,10 @@ th{{font-size:13px;color:#667085;text-transform:uppercase;letter-spacing:.4px}}
 .score-note{{font-size:11px;font-weight:800;border-radius:999px;padding:4px 7px}}
 .score-note.danger{{background:#fde2e1;color:#b42318}}
 .score-note.warning{{background:#fff4d6;color:#8a5a00}}
+.name-review-section{{margin:0 0 20px;border:2px solid #f59e0b;border-radius:16px;overflow:hidden;background:#fffaf0}}
+.review-title{{font-size:18px;font-weight:900;color:#9a5a00;padding:16px 18px 4px}}
+.review-subtitle{{font-size:13px;color:#8a6500;padding:0 18px 14px}}
+.row-name-review{{background:#fff8e6}}
 .score-note.good{{background:#e9f8ef;color:#14804a}}
 .proof-btn{{display:inline-block;text-decoration:none;color:#17212b;border:1px solid #d8dde3;background:#fff;padding:8px 10px;border-radius:8px;font-size:13px;font-weight:800}}
 .proof-btn:hover{{background:#f4f6f8}}
@@ -1162,6 +1435,7 @@ th{{font-size:13px;color:#667085;text-transform:uppercase;letter-spacing:.4px}}
 </section>
 
 <section class="panel table-wrap">
+    {unresolved_table}
     {table_content}
 </section>
 
