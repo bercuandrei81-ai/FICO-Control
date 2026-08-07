@@ -450,38 +450,187 @@ def driver_page():
 *{{box-sizing:border-box}}
 body{{margin:0;font-family:Arial,sans-serif;background:#f4f6f8;color:#17212b}}
 .card{{width:min(92%,500px);margin:45px auto;background:#fff;padding:30px;border-radius:20px;box-shadow:0 12px 35px rgba(0,0,0,.08)}}
-.brand{{font-size:13px;font-weight:800;letter-spacing:2px}}
+.topbar{{display:flex;align-items:center;justify-content:space-between;gap:16px}}
+.brand{{font-size:13px;font-weight:800;letter-spacing:2px;white-space:nowrap}}
+.languages{{display:flex;gap:5px;background:#f4f6f8;padding:4px;border-radius:10px}}
+.lang-btn{{width:auto;margin:0;padding:7px 9px;border:0;border-radius:7px;background:transparent;color:#667085;font-size:12px;font-weight:800;cursor:pointer}}
+.lang-btn.active{{background:#17212b;color:#fff}}
 h1{{font-size:31px;margin:22px 0 8px}}
 .muted{{color:#667085;line-height:1.45}}
 label{{display:block;margin:20px 0 8px;font-weight:700}}
 input,button{{width:100%;padding:14px;border-radius:11px;border:1px solid #d8dde3;font-size:16px}}
 input[type=file]{{background:#fff}}
-button{{margin-top:22px;background:#17212b;color:#fff;border:0;font-weight:800;cursor:pointer}}
+.submit{{margin-top:22px;background:#17212b;color:#fff;border:0;font-weight:800;cursor:pointer}}
 .hint{{font-size:13px;color:#667085;margin-top:7px}}
+.notice{{display:none;margin:18px 0 0;padding:12px 14px;border-radius:10px;font-size:14px;font-weight:700;line-height:1.4}}
+.notice.success{{display:block;background:#eaf7ef;color:#146c43}}
+.notice.error{{display:block;background:#fdeeee;color:#b42318}}
+@media(max-width:420px){{
+  .card{{padding:23px}}
+  .topbar{{align-items:flex-start}}
+  .brand{{font-size:12px}}
+  .lang-btn{{padding:7px}}
+}}
 </style>
 </head>
 <body>
 <main class="card">
-<div class="brand">FICO CONTROL</div>
-<h1>Trimite scorul FICO</h1>
-<p class="muted">{today}<br>Încarcă o poză sau un screenshot clar în care scorul FICO este vizibil.</p>
+<div class="topbar">
+  <div class="brand">FICO CONTROL</div>
+  <div class="languages" aria-label="Language">
+    <button type="button" class="lang-btn" data-lang="ro">RO</button>
+    <button type="button" class="lang-btn" data-lang="de">DE</button>
+    <button type="button" class="lang-btn" data-lang="en">EN</button>
+  </div>
+</div>
+
+<h1 data-i18n="title">Trimite scorul FICO</h1>
+<p class="muted">
+  {today}<br>
+  <span data-i18n="intro">Încarcă o poză sau un screenshot clar în care scorul FICO este vizibil.</span>
+</p>
+
+<div id="notice" class="notice"></div>
 
 <form action="/submit" method="post" enctype="multipart/form-data">
 
-<label>1. Poză / Screenshot FICO</label>
-<input type="file" name="proof" accept="image/jpeg,image/png,image/webp" required>
-<div class="hint">JPG, PNG sau WEBP · maximum 10 MB</div>
+<label data-i18n="photoLabel">1. Poză / Screenshot FICO</label>
+<input id="proof" type="file" name="proof" accept="image/jpeg,image/png,image/webp" required>
+<div class="hint" data-i18n="photoHint">JPG, PNG sau WEBP · maximum 10 MB</div>
 
-<label>2. Numele complet</label>
-<input type="text" name="full_name" autocomplete="name" placeholder="Prenume și nume complet" required>
-<div class="hint">Scrie numele exact așa cum apare în lista de lucru.</div>
+<label data-i18n="nameLabel">2. Numele complet</label>
+<input id="fullName" type="text" name="full_name" autocomplete="name" placeholder="Prenume și nume complet" required>
+<div class="hint" data-i18n="nameHint">Scrie numele exact așa cum apare în lista de lucru.</div>
 
-<label>3. Scor FICO</label>
-<input type="number" name="fico_score" min="0" max="1000" inputmode="numeric" placeholder="ex. 850" required>
+<label data-i18n="scoreLabel">3. Scor FICO</label>
+<input id="ficoScore" type="number" name="fico_score" min="0" max="1000" inputmode="numeric" placeholder="ex. 850" required>
 
-<button type="submit">Trimite scorul și dovada</button>
+<button class="submit" type="submit" data-i18n="submit">Trimite scorul și dovada</button>
 </form>
 </main>
+
+<script>
+const translations = {{
+  ro: {{
+    title: "Trimite scorul FICO",
+    intro: "Încarcă o poză sau un screenshot clar în care scorul FICO este vizibil.",
+    photoLabel: "1. Poză / Screenshot FICO",
+    photoHint: "JPG, PNG sau WEBP · maximum 10 MB",
+    nameLabel: "2. Numele complet",
+    nameHint: "Scrie numele exact așa cum apare în lista de lucru.",
+    namePlaceholder: "Prenume și nume complet",
+    scoreLabel: "3. Scor FICO",
+    scorePlaceholder: "ex. 850",
+    submit: "Trimite scorul și dovada",
+    success: "Scorul FICO și dovada au fost trimise cu succes.",
+    already_sent: "Ai trimis deja scorul FICO pentru astăzi.",
+    name_not_found: "Numele introdus nu apare în lista șoferilor programați astăzi.",
+    invalid_score: "Scorul FICO introdus nu este valid.",
+    invalid_image_type: "Te rog să încarci o imagine JPG, PNG sau WEBP.",
+    empty_image: "Imaginea selectată este goală. Te rog să alegi alt fișier.",
+    image_too_large: "Imaginea este prea mare. Dimensiunea maximă este 10 MB.",
+    generic_error: "Trimiterea nu a putut fi finalizată. Te rog să încerci din nou."
+  }},
+  de: {{
+    title: "FICO-Score senden",
+    intro: "Lade ein klares Foto oder einen Screenshot hoch, auf dem der FICO-Score sichtbar ist.",
+    photoLabel: "1. FICO Foto / Screenshot",
+    photoHint: "JPG, PNG oder WEBP · maximal 10 MB",
+    nameLabel: "2. Vollständiger Name",
+    nameHint: "Schreibe deinen Namen genau so, wie er in der Fahrer-/Arbeitsliste steht.",
+    namePlaceholder: "Vor- und Nachname",
+    scoreLabel: "3. FICO-Score",
+    scorePlaceholder: "z. B. 850",
+    submit: "Score und Nachweis senden",
+    success: "FICO-Score und Nachweis wurden erfolgreich gesendet.",
+    already_sent: "Du hast deinen FICO-Score für heute bereits gesendet.",
+    name_not_found: "Der eingegebene Name steht heute nicht auf der Liste der eingeplanten Fahrer.",
+    invalid_score: "Der eingegebene FICO-Score ist ungültig.",
+    invalid_image_type: "Bitte lade ein JPG-, PNG- oder WEBP-Bild hoch.",
+    empty_image: "Die ausgewählte Bilddatei ist leer. Bitte wähle eine andere Datei.",
+    image_too_large: "Das Bild ist zu groß. Die maximale Dateigröße beträgt 10 MB.",
+    generic_error: "Die Übermittlung konnte nicht abgeschlossen werden. Bitte versuche es erneut."
+  }},
+  en: {{
+    title: "Submit FICO Score",
+    intro: "Upload a clear photo or screenshot where the FICO score is visible.",
+    photoLabel: "1. FICO Photo / Screenshot",
+    photoHint: "JPG, PNG or WEBP · maximum 10 MB",
+    nameLabel: "2. Full Name",
+    nameHint: "Enter your name exactly as it appears on the driver/work list.",
+    namePlaceholder: "First and last name",
+    scoreLabel: "3. FICO Score",
+    scorePlaceholder: "e.g. 850",
+    submit: "Submit score and proof",
+    success: "Your FICO score and proof were submitted successfully.",
+    already_sent: "You have already submitted your FICO score for today.",
+    name_not_found: "The entered name is not on today's scheduled driver list.",
+    invalid_score: "The FICO score you entered is invalid.",
+    invalid_image_type: "Please upload a JPG, PNG, or WEBP image.",
+    empty_image: "The selected image is empty. Please choose another file.",
+    image_too_large: "The image is too large. The maximum file size is 10 MB.",
+    generic_error: "The submission could not be completed. Please try again."
+  }}
+}};
+
+function detectInitialLanguage() {{
+  const saved = localStorage.getItem("ficoLanguage");
+  if (saved && translations[saved]) return saved;
+
+  const browser = (navigator.language || "").toLowerCase();
+  if (browser.startsWith("de")) return "de";
+  if (browser.startsWith("en")) return "en";
+  return "ro";
+}}
+
+function applyLanguage(lang) {{
+  if (!translations[lang]) lang = "ro";
+  localStorage.setItem("ficoLanguage", lang);
+  document.documentElement.lang = lang;
+
+  const t = translations[lang];
+  document.querySelectorAll("[data-i18n]").forEach(el => {{
+    const key = el.dataset.i18n;
+    if (t[key]) el.textContent = t[key];
+  }});
+
+  document.getElementById("fullName").placeholder = t.namePlaceholder;
+  document.getElementById("ficoScore").placeholder = t.scorePlaceholder;
+
+  document.querySelectorAll(".lang-btn").forEach(btn => {{
+    btn.classList.toggle("active", btn.dataset.lang === lang);
+  }});
+
+  renderNotice(lang);
+}}
+
+function renderNotice(lang) {{
+  const params = new URLSearchParams(window.location.search);
+  const notice = document.getElementById("notice");
+  const t = translations[lang];
+
+  notice.className = "notice";
+  notice.textContent = "";
+
+  if (params.get("success") === "1") {{
+    notice.textContent = t.success;
+    notice.classList.add("success");
+    return;
+  }}
+
+  const error = params.get("error");
+  if (error) {{
+    notice.textContent = t[error] || t.generic_error;
+    notice.classList.add("error");
+  }}
+}}
+
+document.querySelectorAll(".lang-btn").forEach(btn => {{
+  btn.addEventListener("click", () => applyLanguage(btn.dataset.lang));
+}});
+
+applyLanguage(detectInitialLanguage());
+</script>
 </body>
 </html>
 """
