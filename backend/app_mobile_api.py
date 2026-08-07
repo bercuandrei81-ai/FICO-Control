@@ -10,6 +10,10 @@ import openpyxl
 import os
 import uuid
 import unicodedata
+from difflib import SequenceMatcher
+import json
+import urllib.request
+import urllib.parse
 import re
 
 DB = "fico.db"
@@ -68,6 +72,9 @@ def init_db():
     ensure_column(conn, "submissions", "entered_full_name", "TEXT")
     ensure_column(conn, "submissions", "proof_filename", "TEXT")
     ensure_column(conn, "submissions", "proof_original_name", "TEXT")
+    ensure_column(conn, "submissions", "detected_fico_score", "INTEGER")
+    ensure_column(conn, "submissions", "verification_status", "TEXT")
+    ensure_column(conn, "submissions", "name_match_score", "REAL")
 
     conn.commit()
     conn.close()
@@ -76,30 +83,186 @@ def init_db():
 init_db()
 
 
+
 def normalize_name(value: str) -> str:
-    value = unicodedata.normalize("NFKC", value or "")
+    value = unicodedata.normalize("NFKD", value or "")
+    value = "".join(ch for ch in value if not unicodedata.combining(ch))
+    value = value.replace("-", " ")
     value = " ".join(value.strip().split())
     return value.casefold()
 
 
+def name_similarity(a: str, b: str) -> float:
+    a_n = normalize_name(a)
+    b_n = normalize_name(b)
+
+    if not a_n or not b_n:
+        return 0.0
+
+    # Exact / strong prefix matching gets priority.
+    if a_n == b_n:
+        return 1.0
+
+    if b_n.startswith(a_n) or a_n.startswith(b_n):
+        shorter = min(len(a_n), len(b_n))
+        longer = max(len(a_n), len(b_n))
+        return 0.90 + (0.10 * shorter / max(longer, 1))
+
+    # Compare token initials and general similarity.
+    ratio = SequenceMatcher(None, a_n, b_n).ratio()
+
+    a_tokens = a_n.split()
+    b_tokens = b_n.split()
+
+    token_score = 0.0
+    if a_tokens and b_tokens:
+        matches = 0
+        for i, token in enumerate(a_tokens):
+            if i >= len(b_tokens):
+                break
+            target = b_tokens[i]
+            if target.startswith(token) or token.startswith(target):
+                matches += 1
+        token_score = matches / max(len(a_tokens), len(b_tokens))
+
+    return max(ratio, token_score * 0.96)
+
+
 def find_required_driver(conn, work_date: str, entered_name: str):
-    target = normalize_name(entered_name)
+    entered = " ".join((entered_name or "").strip().split())
+    target = normalize_name(entered)
 
     rows = conn.execute("""
         SELECT d.id, d.name
         FROM daily_required r
         JOIN drivers d ON d.id = r.driver_id
         WHERE r.work_date = ?
+        ORDER BY d.name
     """, (work_date,)).fetchall()
 
+    # Exact match first.
     for row in rows:
         if normalize_name(row["name"]) == target:
-            return row
+            return row, 1.0, False
 
-    return None
+    scored = []
+    for row in rows:
+        score = name_similarity(entered, row["name"])
+        scored.append((score, row))
+
+    scored.sort(key=lambda item: item[0], reverse=True)
+
+    if not scored:
+        return None, 0.0, False
+
+    best_score, best_row = scored[0]
+    second_score = scored[1][0] if len(scored) > 1 else 0.0
+
+    # Accept short but clear prefixes such as "Elvis V".
+    # Reject ambiguous matches when the top two are too close.
+    if best_score >= 0.82:
+        ambiguous = second_score >= 0.80 and (best_score - second_score) < 0.08
+        if ambiguous:
+            return None, best_score, True
+        return best_row, best_score, False
+
+    return None, best_score, False
 
 
-async def save_proof_image(proof: UploadFile) -> tuple[str, str]:
+def extract_fico_candidates_from_text(text_value: str) -> list[int]:
+    if not text_value:
+        return []
+
+    candidates = []
+    for match in re.findall(r"(?<!\d)(\d{3})(?!\d)", text_value):
+        try:
+            value = int(match)
+        except ValueError:
+            continue
+
+        # FICO in this workflow is capped at 850.
+        if 300 <= value <= 850:
+            candidates.append(value)
+
+    return candidates
+
+
+def detect_fico_from_image_bytes(raw: bytes, content_type: str) -> tuple[int | None, str]:
+    """
+    Optional OCR integration.
+
+    If environment variable OCRSPACE_API_KEY is configured on Render,
+    the image is sent to OCR.Space and the returned text is searched for
+    a plausible FICO score. Without an OCR key, the function returns
+    'ocr_not_configured' and Admin will request manual verification.
+    """
+    api_key = os.getenv("OCRSPACE_API_KEY", "").strip()
+
+    if not api_key:
+        return None, "ocr_not_configured"
+
+    boundary = "----FICOControlBoundary7MA4YWxkTrZu0gW"
+    ext = "jpg"
+    if content_type == "image/png":
+        ext = "png"
+    elif content_type == "image/webp":
+        ext = "webp"
+
+    parts = []
+
+    def add_field(name, value):
+        parts.append(
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="{name}"\r\n\r\n'
+            f"{value}\r\n".encode("utf-8")
+        )
+
+    add_field("apikey", api_key)
+    add_field("language", "eng")
+    add_field("isOverlayRequired", "false")
+    add_field("OCREngine", "2")
+
+    file_header = (
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="file"; filename="fico.{ext}"\r\n'
+        f"Content-Type: {content_type}\r\n\r\n"
+    ).encode("utf-8")
+
+    parts.append(file_header + raw + b"\r\n")
+    parts.append(f"--{boundary}--\r\n".encode("utf-8"))
+    body = b"".join(parts)
+
+    req = urllib.request.Request(
+        "https://api.ocr.space/parse/image",
+        data=body,
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        method="POST"
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=20) as response:
+            payload = json.loads(response.read().decode("utf-8", errors="replace"))
+    except Exception:
+        return None, "ocr_error"
+
+    parsed = payload.get("ParsedResults") or []
+    combined = "\n".join(
+        str(item.get("ParsedText") or "")
+        for item in parsed
+    )
+
+    candidates = extract_fico_candidates_from_text(combined)
+
+    if not candidates:
+        return None, "ocr_unreadable"
+
+    # Usually the FICO score is the highest relevant 3-digit number in
+    # the screenshot. Prefer 850 when present, otherwise the highest.
+    detected = max(candidates)
+    return detected, "ocr_ok"
+
+
+async def save_proof_image(proof: UploadFile) -> tuple[str, str, bytes]:
     if proof.content_type not in ALLOWED_IMAGE_TYPES:
         raise HTTPException(status_code=400, detail="invalid_image_type")
 
@@ -123,7 +286,7 @@ async def save_proof_image(proof: UploadFile) -> tuple[str, str]:
     with open(path, "wb") as f:
         f.write(raw)
 
-    return filename, (proof.filename or "proof")
+    return filename, (proof.filename or "proof"), raw
 
 
 class SubmissionIn(BaseModel):
@@ -160,7 +323,7 @@ def drivers_today():
 # Kept temporarily for compatibility with the existing mobile prototype.
 @app.post("/api/submissions")
 def submit_mobile_legacy(payload: SubmissionIn):
-    if payload.fico_score < 0 or payload.fico_score > 1000:
+    if payload.fico_score < 0 or payload.fico_score > 850:
         raise HTTPException(status_code=400, detail="invalid_score")
 
     today = date.today().isoformat()
@@ -200,19 +363,24 @@ def submit_mobile_legacy(payload: SubmissionIn):
     return {"ok": True}
 
 
+
 @app.post("/api/submissions/photo")
 async def submit_mobile_photo(
     full_name: str = Form(...),
     fico_score: int = Form(...),
     proof: UploadFile = File(...)
 ):
-    if fico_score < 0 or fico_score > 1000:
+    if fico_score < 300 or fico_score > 850:
         raise HTTPException(status_code=400, detail="invalid_score")
 
     today = date.today().isoformat()
     conn = db()
 
-    driver = find_required_driver(conn, today, full_name)
+    driver, match_score, ambiguous = find_required_driver(conn, today, full_name)
+
+    if ambiguous:
+        conn.close()
+        raise HTTPException(status_code=400, detail="ambiguous_name")
 
     if not driver:
         conn.close()
@@ -228,10 +396,22 @@ async def submit_mobile_photo(
         raise HTTPException(status_code=409, detail="already_sent")
 
     try:
-        filename, original_name = await save_proof_image(proof)
+        filename, original_name, raw = await save_proof_image(proof)
     except Exception:
         conn.close()
         raise
+
+    detected_score, ocr_state = detect_fico_from_image_bytes(
+        raw,
+        proof.content_type or "image/jpeg"
+    )
+
+    if detected_score is None:
+        verification_status = "manual_review"
+    elif detected_score == fico_score:
+        verification_status = "verified"
+    else:
+        verification_status = "mismatch"
 
     conn.execute("""
         INSERT INTO submissions(
@@ -241,8 +421,11 @@ async def submit_mobile_photo(
             submitted_at,
             entered_full_name,
             proof_filename,
-            proof_original_name
-        ) VALUES(?,?,?,?,?,?,?)
+            proof_original_name,
+            detected_fico_score,
+            verification_status,
+            name_match_score
+        ) VALUES(?,?,?,?,?,?,?,?,?,?)
     """, (
         today,
         driver["id"],
@@ -250,13 +433,23 @@ async def submit_mobile_photo(
         datetime.now().isoformat(timespec="seconds"),
         " ".join(full_name.strip().split()),
         filename,
-        original_name
+        original_name,
+        detected_score,
+        verification_status,
+        match_score
     ))
 
     conn.commit()
     conn.close()
 
-    return {"ok": True, "driver": driver["name"]}
+    return {
+        "ok": True,
+        "driver": driver["name"],
+        "name_match_score": round(match_score, 3),
+        "detected_fico_score": detected_score,
+        "verification_status": verification_status,
+        "ocr_state": ocr_state
+    }
 
 
 def extract_driver_names_from_xlsx(raw: bytes) -> list[str]:
@@ -375,18 +568,24 @@ async def upload_daily_list(
     )
 
 
+
 @app.post("/submit")
 async def submit_web(
     full_name: str = Form(...),
     fico_score: int = Form(...),
     proof: UploadFile = File(...)
 ):
-    if fico_score < 0 or fico_score > 1000:
+    if fico_score < 300 or fico_score > 850:
         return RedirectResponse("/?error=invalid_score", status_code=303)
 
     today = date.today().isoformat()
     conn = db()
-    driver = find_required_driver(conn, today, full_name)
+
+    driver, match_score, ambiguous = find_required_driver(conn, today, full_name)
+
+    if ambiguous:
+        conn.close()
+        return RedirectResponse("/?error=ambiguous_name", status_code=303)
 
     if not driver:
         conn.close()
@@ -402,10 +601,22 @@ async def submit_web(
         return RedirectResponse("/?error=already_sent", status_code=303)
 
     try:
-        filename, original_name = await save_proof_image(proof)
+        filename, original_name, raw = await save_proof_image(proof)
     except HTTPException as exc:
         conn.close()
         return RedirectResponse(f"/?error={exc.detail}", status_code=303)
+
+    detected_score, ocr_state = detect_fico_from_image_bytes(
+        raw,
+        proof.content_type or "image/jpeg"
+    )
+
+    if detected_score is None:
+        verification_status = "manual_review"
+    elif detected_score == fico_score:
+        verification_status = "verified"
+    else:
+        verification_status = "mismatch"
 
     conn.execute("""
         INSERT INTO submissions(
@@ -415,8 +626,11 @@ async def submit_web(
             submitted_at,
             entered_full_name,
             proof_filename,
-            proof_original_name
-        ) VALUES(?,?,?,?,?,?,?)
+            proof_original_name,
+            detected_fico_score,
+            verification_status,
+            name_match_score
+        ) VALUES(?,?,?,?,?,?,?,?,?,?)
     """, (
         today,
         driver["id"],
@@ -424,7 +638,10 @@ async def submit_web(
         datetime.now().isoformat(timespec="seconds"),
         " ".join(full_name.strip().split()),
         filename,
-        original_name
+        original_name,
+        detected_score,
+        verification_status,
+        match_score
     ))
 
     conn.commit()
@@ -513,7 +730,7 @@ input[type=file]{{background:#fff}}
 <div class="hint" data-i18n="nameHint">Scrie numele exact așa cum apare în lista de lucru.</div>
 
 <label data-i18n="scoreLabel">3. Scor FICO</label>
-<input id="ficoScore" type="number" name="fico_score" min="0" max="1000" inputmode="numeric" placeholder="ex. 850" required>
+<input id="ficoScore" type="number" name="fico_score" min="0" max="850" inputmode="numeric" placeholder="ex. 850" required>
 
 <button class="submit" type="submit" data-i18n="submit">Trimite scorul și dovada</button>
 </form>
@@ -535,6 +752,7 @@ const translations = {{
     success: "Scorul FICO și dovada au fost trimise cu succes.",
     already_sent: "Ai trimis deja scorul FICO pentru astăzi.",
     name_not_found: "Numele introdus nu apare în lista șoferilor programați astăzi.",
+    ambiguous_name: "Numele este prea scurt sau seamănă cu mai mulți șoferi. Te rog să scrii mai mult din numele complet.",
     invalid_score: "Scorul FICO introdus nu este valid.",
     invalid_image_type: "Te rog să încarci o imagine JPG, PNG sau WEBP.",
     empty_image: "Imaginea selectată este goală. Te rog să alegi alt fișier.",
@@ -555,6 +773,7 @@ const translations = {{
     success: "FICO-Score und Nachweis wurden erfolgreich gesendet.",
     already_sent: "Du hast deinen FICO-Score für heute bereits gesendet.",
     name_not_found: "Der eingegebene Name steht heute nicht auf der Liste der eingeplanten Fahrer.",
+    ambiguous_name: "Der Name ist zu kurz oder passt zu mehreren Fahrern. Bitte gib mehr vom vollständigen Namen ein.",
     invalid_score: "Der eingegebene FICO-Score ist ungültig.",
     invalid_image_type: "Bitte lade ein JPG-, PNG- oder WEBP-Bild hoch.",
     empty_image: "Die ausgewählte Bilddatei ist leer. Bitte wähle eine andere Datei.",
@@ -575,6 +794,7 @@ const translations = {{
     success: "Your FICO score and proof were submitted successfully.",
     already_sent: "You have already submitted your FICO score for today.",
     name_not_found: "The entered name is not on today's scheduled driver list.",
+    ambiguous_name: "The name is too short or matches multiple drivers. Please enter more of the full name.",
     invalid_score: "The FICO score you entered is invalid.",
     invalid_image_type: "Please upload a JPG, PNG, or WEBP image.",
     empty_image: "The selected image is empty. Please choose another file.",
@@ -662,6 +882,9 @@ def admin_page(d: str | None = None, q: str | None = None):
                s.entered_full_name,
                s.proof_filename,
                s.proof_original_name,
+               s.detected_fico_score,
+               s.verification_status,
+               s.name_match_score,
                CASE WHEN s.id IS NULL THEN 0 ELSE 1 END AS sent
         FROM daily_required r
         JOIN drivers d ON d.id = r.driver_id
@@ -680,6 +903,11 @@ def admin_page(d: str | None = None, q: str | None = None):
     low_fico = sum(
         1 for r in rows
         if r["fico_score"] is not None and int(r["fico_score"]) < 800
+    )
+
+    needs_review = sum(
+        1 for r in rows
+        if r["verification_status"] in ("mismatch", "manual_review")
     )
 
     missing_names = [r["name"] for r in rows if not r["sent"]]
@@ -726,6 +954,25 @@ def admin_page(d: str | None = None, q: str | None = None):
 
         entered_name = html.escape(r["entered_full_name"]) if r["entered_full_name"] else "—"
 
+        detected_fico = (
+            r["detected_fico_score"]
+            if r["detected_fico_score"] is not None
+            else "—"
+        )
+
+        verification_status = r["verification_status"] or (
+            "manual_review" if sent_bool else ""
+        )
+
+        if verification_status == "verified":
+            verification = '<span class="verify-pill verified">✓ Verificat</span>'
+        elif verification_status == "mismatch":
+            verification = '<span class="verify-pill mismatch">⚠ Verifică</span>'
+        elif verification_status == "manual_review":
+            verification = '<span class="verify-pill manual">? Manual</span>'
+        else:
+            verification = '<span class="dash">—</span>'
+
         table_rows += f"""
         <tr class="{'row-missing' if not sent_bool else ''}">
             <td>
@@ -739,6 +986,8 @@ def admin_page(d: str | None = None, q: str | None = None):
                     {score_badge}
                 </div>
             </td>
+            <td><strong>{detected_fico}</strong></td>
+            <td>{verification}</td>
             <td>{hour}</td>
             <td>{proof}</td>
         </tr>
@@ -749,7 +998,7 @@ def admin_page(d: str | None = None, q: str | None = None):
     if filtered_rows:
         table_content = (
             '<table><thead><tr>'
-            '<th>Șofer</th><th>Status</th><th>FICO</th><th>Ora</th><th>Dovadă</th>'
+            '<th>Șofer</th><th>Status</th><th>FICO introdus</th><th>FICO detectat</th><th>Verificare</th><th>Ora</th><th>Dovadă</th>'
             '</tr></thead><tbody>'
             + table_rows +
             '</tbody></table>'
@@ -775,7 +1024,7 @@ h1{{font-size:38px;margin:14px 0 0}}
 .btn,.btn-light{{display:inline-flex;align-items:center;justify-content:center;text-decoration:none;padding:12px 15px;border-radius:10px;font-size:14px;font-weight:800;cursor:pointer}}
 .btn{{border:0;background:#17212b;color:#fff}}
 .btn-light{{border:1px solid #d8dde3;background:#fff;color:#17212b}}
-.stats{{display:grid;grid-template-columns:repeat(4,1fr);gap:15px;margin-bottom:20px}}
+.stats{{display:grid;grid-template-columns:repeat(5,1fr);gap:15px;margin-bottom:20px}}
 .card,.panel{{background:#fff;border-radius:16px;box-shadow:0 5px 18px rgba(0,0,0,.05)}}
 .card{{padding:20px}}
 .card strong{{display:block;font-size:32px;line-height:1;margin-bottom:8px}}
@@ -807,6 +1056,10 @@ th{{font-size:13px;color:#667085;text-transform:uppercase;letter-spacing:.4px}}
 .score-note.good{{background:#e9f8ef;color:#14804a}}
 .proof-btn{{display:inline-block;text-decoration:none;color:#17212b;border:1px solid #d8dde3;background:#fff;padding:8px 10px;border-radius:8px;font-size:13px;font-weight:800}}
 .proof-btn:hover{{background:#f4f6f8}}
+.verify-pill{{display:inline-block;border-radius:999px;padding:6px 9px;font-size:12px;font-weight:800}}
+.verify-pill.verified{{background:#e9f8ef;color:#14804a}}
+.verify-pill.mismatch{{background:#fde2e1;color:#b42318}}
+.verify-pill.manual{{background:#fff4d6;color:#8a5a00}}
 .dash{{color:#98a2b3}}
 .helper{{font-size:12px;color:#667085;margin-top:10px}}
 .copy-ok{{display:none;margin-left:4px;color:#14804a;font-size:13px;font-weight:800}}
@@ -838,6 +1091,7 @@ th{{font-size:13px;color:#667085;text-transform:uppercase;letter-spacing:.4px}}
     <div class="card"><strong>{sent}</strong><span>Au trimis</span></div>
     <div class="card alert"><strong>{missing}</strong><span>Lipsesc</span></div>
     <div class="card alert"><strong>{low_fico}</strong><span>FICO sub 800</span></div>
+    <div class="card alert"><strong>{needs_review}</strong><span>Necesită verificare</span></div>
 </section>
 
 <section class="panel">
@@ -907,7 +1161,10 @@ def export_day_excel(d: str | None = None):
                s.fico_score,
                s.submitted_at,
                COALESCE(s.entered_full_name, '') AS entered_full_name,
-               COALESCE(s.proof_filename, '') AS proof_filename
+               COALESCE(s.proof_filename, '') AS proof_filename,
+               s.detected_fico_score,
+               COALESCE(s.verification_status, '') AS verification_status,
+               s.name_match_score
         FROM daily_required r
         JOIN drivers d ON d.id = r.driver_id
         LEFT JOIN submissions s
@@ -928,9 +1185,12 @@ def export_day_excel(d: str | None = None):
     headers = [
         "Șofer",
         "Status",
-        "FICO",
+        "FICO introdus",
+        "FICO detectat",
+        "Verificare",
         "Ora trimiterii",
         "Nume introdus",
+        "Potrivire nume",
         "Dovadă"
     ]
     ws.append(headers)
@@ -941,8 +1201,11 @@ def export_day_excel(d: str | None = None):
             row["name"],
             row["status"],
             row["fico_score"] if row["fico_score"] is not None else "",
+            row["detected_fico_score"] if row["detected_fico_score"] is not None else "",
+            row["verification_status"],
             row["submitted_at"] or "",
             row["entered_full_name"],
+            round(float(row["name_match_score"]), 3) if row["name_match_score"] is not None else "",
             proof
         ])
 
@@ -962,10 +1225,13 @@ def export_day_excel(d: str | None = None):
     widths = {
         "A": 30,
         "B": 16,
-        "C": 12,
-        "D": 23,
-        "E": 30,
-        "F": 30
+        "C": 15,
+        "D": 15,
+        "E": 20,
+        "F": 23,
+        "G": 30,
+        "H": 15,
+        "I": 30
     }
 
     for col, width in widths.items():
@@ -979,7 +1245,7 @@ def export_day_excel(d: str | None = None):
         score = ws[f"C{row_idx}"].value
 
         if status == "Nu a trimis":
-            for col_idx in range(1, 7):
+            for col_idx in range(1, 10):
                 ws.cell(row=row_idx, column=col_idx).fill = missing_fill
 
         if isinstance(score, int) and score < 800:
