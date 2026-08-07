@@ -10,6 +10,7 @@ import openpyxl
 import os
 import uuid
 import unicodedata
+import re
 
 DB = "fico.db"
 UPLOAD_DIR = "uploads"
@@ -304,7 +305,16 @@ def extract_driver_names_from_xlsx(raw: bytes) -> list[str]:
         if name_index >= len(row) or row[name_index] is None:
             continue
 
-        name = str(row[name_index]).strip()
+        raw_name = str(row[name_index]).strip()
+        if not raw_name:
+            continue
+
+        # Cortex can show the assigned driver followed by rescue/helper drivers
+        # in the same cell, usually separated by "|" or line breaks.
+        # For FICO Control, ONLY the first driver belongs to that route.
+        parts = re.split(r"[|\\n\\r]+", raw_name)
+        name = next((part.strip() for part in parts if part.strip()), "")
+
         if not name:
             continue
 
