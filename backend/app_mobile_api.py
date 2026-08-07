@@ -637,9 +637,12 @@ applyLanguage(detectInitialLanguage());
     return HTMLResponse(page)
 
 
+
 @app.get("/admin", response_class=HTMLResponse)
-def admin_page(d: str | None = None):
+def admin_page(d: str | None = None, q: str | None = None):
     selected = d or date.today().isoformat()
+    search = (q or "").strip()
+
     conn = db()
 
     rows = conn.execute("""
@@ -648,6 +651,7 @@ def admin_page(d: str | None = None):
                s.submitted_at,
                s.entered_full_name,
                s.proof_filename,
+               s.proof_original_name,
                CASE WHEN s.id IS NULL THEN 0 ELSE 1 END AS sent
         FROM daily_required r
         JOIN drivers d ON d.id = r.driver_id
@@ -663,29 +667,85 @@ def admin_page(d: str | None = None):
     total = len(rows)
     sent = sum(int(r["sent"]) for r in rows)
     missing = total - sent
+    low_fico = sum(
+        1 for r in rows
+        if r["fico_score"] is not None and int(r["fico_score"]) < 800
+    )
+
+    missing_names = [r["name"] for r in rows if not r["sent"]]
+
+    filtered_rows = rows
+    if search:
+        key = normalize_name(search)
+        filtered_rows = [
+            r for r in rows
+            if key in normalize_name(r["name"])
+            or key in normalize_name(r["entered_full_name"] or "")
+        ]
 
     table_rows = ""
 
-    for r in rows:
-        status = "Trimis" if r["sent"] else "Nu a trimis"
-        status_class = "sent" if r["sent"] else "missing"
+    for r in filtered_rows:
+        sent_bool = bool(r["sent"])
+        status = "Trimis" if sent_bool else "Nu a trimis"
+        status_class = "sent" if sent_bool else "missing"
+
         fico = r["fico_score"] if r["fico_score"] is not None else "—"
         hour = r["submitted_at"][11:16] if r["submitted_at"] else "—"
 
+        score_class = ""
+        score_badge = ""
+
+        if r["fico_score"] is not None:
+            score = int(r["fico_score"])
+            if score < 800:
+                score_class = "score-low"
+                score_badge = '<span class="score-note danger">Scăzut</span>'
+            elif score < 850:
+                score_class = "score-mid"
+                score_badge = '<span class="score-note warning">Sub 850</span>'
+            else:
+                score_class = "score-good"
+                score_badge = '<span class="score-note good">850</span>'
+
         if r["proof_filename"]:
-            proof = f'<a class="proof" href="/proof/{html.escape(r["proof_filename"])}" target="_blank">Vezi poza</a>'
+            proof_url = f'/proof/{html.escape(r["proof_filename"])}'
+            proof = f'<a class="proof-btn" href="{proof_url}" target="_blank">Vezi poza</a>'
         else:
-            proof = "—"
+            proof = '<span class="dash">—</span>'
+
+        entered_name = html.escape(r["entered_full_name"]) if r["entered_full_name"] else "—"
 
         table_rows += f"""
-        <tr>
-            <td>{html.escape(r["name"])}</td>
-            <td class="{status_class}">{status}</td>
-            <td>{fico}</td>
+        <tr class="{'row-missing' if not sent_bool else ''}">
+            <td>
+                <div class="driver-name">{html.escape(r["name"])}</div>
+                <div class="entered-name">Introdus: {entered_name}</div>
+            </td>
+            <td><span class="status-pill {status_class}">{status}</span></td>
+            <td class="{score_class}">
+                <div class="score-wrap">
+                    <strong>{fico}</strong>
+                    {score_badge}
+                </div>
+            </td>
             <td>{hour}</td>
             <td>{proof}</td>
         </tr>
         """
+
+    missing_js = "\n".join(missing_names).replace("\\", "\\\\").replace("`", "\\`")
+
+    if filtered_rows:
+        table_content = (
+            '<table><thead><tr>'
+            '<th>Șofer</th><th>Status</th><th>FICO</th><th>Ora</th><th>Dovadă</th>'
+            '</tr></thead><tbody>'
+            + table_rows +
+            '</tbody></table>'
+        )
+    else:
+        table_content = '<div class="empty">Nu există șoferi pentru această selecție.</div>'
 
     page = f"""
 <!doctype html>
@@ -696,83 +756,147 @@ def admin_page(d: str | None = None):
 <title>FICO Control Admin</title>
 <style>
 *{{box-sizing:border-box}}
-body{{margin:0;font-family:Arial,sans-serif;background:#f4f6f8;color:#17212b}}
-.admin{{width:min(95%,1200px);margin:35px auto}}
+body{{margin:0;font-family:Arial,Helvetica,sans-serif;background:#f4f6f8;color:#17212b}}
+.admin{{width:min(96%,1280px);margin:30px auto 60px}}
+.topbar{{display:flex;align-items:flex-start;justify-content:space-between;gap:20px;margin-bottom:28px}}
 .brand{{font-size:13px;font-weight:800;letter-spacing:2px}}
-h1{{font-size:36px;margin:20px 0 35px}}
-.stats{{display:grid;grid-template-columns:repeat(3,1fr);gap:15px;margin-bottom:25px}}
-.card,.panel{{background:#fff;border-radius:16px;padding:20px;box-shadow:0 5px 18px rgba(0,0,0,.05)}}
-.card strong{{display:block;font-size:32px}}
+h1{{font-size:38px;margin:14px 0 0}}
+.top-actions{{display:flex;gap:10px;flex-wrap:wrap;align-items:center}}
+.btn,.btn-light{{display:inline-flex;align-items:center;justify-content:center;text-decoration:none;padding:12px 15px;border-radius:10px;font-size:14px;font-weight:800;cursor:pointer}}
+.btn{{border:0;background:#17212b;color:#fff}}
+.btn-light{{border:1px solid #d8dde3;background:#fff;color:#17212b}}
+.stats{{display:grid;grid-template-columns:repeat(4,1fr);gap:15px;margin-bottom:20px}}
+.card,.panel{{background:#fff;border-radius:16px;box-shadow:0 5px 18px rgba(0,0,0,.05)}}
+.card{{padding:20px}}
+.card strong{{display:block;font-size:32px;line-height:1;margin-bottom:8px}}
 .card span{{color:#667085}}
-.panel{{margin-bottom:15px}}
-form{{display:flex;gap:10px;flex-wrap:wrap;align-items:center}}
+.card.alert strong{{color:#d13b2e}}
+.panel{{padding:20px;margin-bottom:15px}}
+.controls{{display:flex;justify-content:space-between;gap:18px;flex-wrap:wrap}}
+.control-group{{display:flex;gap:10px;flex-wrap:wrap;align-items:center}}
 input,button{{padding:12px 14px;border-radius:10px;border:1px solid #d8dde3;font-size:15px}}
-button{{background:#17212b;color:#fff;border:0;font-weight:800;cursor:pointer}}
-table{{width:100%;border-collapse:collapse}}
-th,td{{text-align:left;padding:13px;border-bottom:1px solid #eceff2}}
-.sent{{color:#14804a;font-weight:800}}
-.missing{{color:#d13b2e;font-weight:800}}
-.proof{{font-weight:700;color:#17212b}}
-@media(max-width:700px){{.stats{{grid-template-columns:1fr}}.panel{{overflow-x:auto}}}}
+button{{cursor:pointer}}
+button.primary{{border:0;background:#17212b;color:#fff;font-weight:800}}
+.search{{min-width:260px}}
+.import-title{{font-size:13px;color:#667085;font-weight:700;margin-bottom:10px}}
+.table-wrap{{overflow-x:auto}}
+table{{width:100%;border-collapse:collapse;min-width:850px}}
+th,td{{text-align:left;padding:14px 13px;border-bottom:1px solid #eceff2;vertical-align:middle}}
+th{{font-size:13px;color:#667085;text-transform:uppercase;letter-spacing:.4px}}
+.driver-name{{font-weight:800}}
+.entered-name{{color:#667085;font-size:12px;margin-top:4px}}
+.status-pill{{display:inline-block;border-radius:999px;padding:6px 9px;font-size:12px;font-weight:800}}
+.status-pill.sent{{background:#e9f8ef;color:#14804a}}
+.status-pill.missing{{background:#fdeeee;color:#c9362b}}
+.row-missing{{background:#fffafa}}
+.score-wrap{{display:flex;align-items:center;gap:8px}}
+.score-wrap strong{{font-size:17px}}
+.score-note{{font-size:11px;font-weight:800;border-radius:999px;padding:4px 7px}}
+.score-note.danger{{background:#fde2e1;color:#b42318}}
+.score-note.warning{{background:#fff4d6;color:#8a5a00}}
+.score-note.good{{background:#e9f8ef;color:#14804a}}
+.proof-btn{{display:inline-block;text-decoration:none;color:#17212b;border:1px solid #d8dde3;background:#fff;padding:8px 10px;border-radius:8px;font-size:13px;font-weight:800}}
+.proof-btn:hover{{background:#f4f6f8}}
+.dash{{color:#98a2b3}}
+.helper{{font-size:12px;color:#667085;margin-top:10px}}
+.copy-ok{{display:none;margin-left:4px;color:#14804a;font-size:13px;font-weight:800}}
+.copy-ok.show{{display:inline}}
+.empty{{padding:35px;text-align:center;color:#667085}}
+@media(max-width:850px){{.stats{{grid-template-columns:repeat(2,1fr)}}.topbar{{display:block}}.top-actions{{margin-top:18px}}}}
+@media(max-width:520px){{.stats{{grid-template-columns:1fr}}h1{{font-size:30px}}.search{{min-width:100%;width:100%}}.control-group{{width:100%}}}}
 </style>
 </head>
 <body>
+
 <main class="admin">
-<div class="brand">FICO CONTROL</div>
-<h1>Admin Dashboard</h1>
+
+<div class="topbar">
+    <div>
+        <div class="brand">FICO CONTROL</div>
+        <h1>Admin Dashboard</h1>
+    </div>
+
+    <div class="top-actions">
+        <a class="btn-light" href="/admin/export.xlsx?d={selected}">Export Excel</a>
+        <button class="btn" type="button" onclick="copyMissing()">Copiază șoferii lipsă</button>
+        <span id="copyOk" class="copy-ok">Copiat</span>
+    </div>
+</div>
 
 <section class="stats">
-<div class="card"><strong>{total}</strong><span>Programați</span></div>
-<div class="card"><strong>{sent}</strong><span>Au trimis</span></div>
-<div class="card"><strong>{missing}</strong><span>Lipsesc</span></div>
+    <div class="card"><strong>{total}</strong><span>Programați</span></div>
+    <div class="card"><strong>{sent}</strong><span>Au trimis</span></div>
+    <div class="card alert"><strong>{missing}</strong><span>Lipsesc</span></div>
+    <div class="card alert"><strong>{low_fico}</strong><span>FICO sub 800</span></div>
 </section>
 
 <section class="panel">
-<form action="/admin" method="get">
-<input type="date" name="d" value="{selected}">
-<button type="submit">Vezi ziua</button>
-</form>
-<br>
-<form action="/admin/upload" method="post" enctype="multipart/form-data">
-<input type="date" name="work_date" value="{selected}" required>
-<input type="file" name="file" accept=".xlsx" required>
-<button type="submit">Încarcă Excel Cortex</button>
-</form>
+    <div class="controls">
+        <form class="control-group" action="/admin" method="get">
+            <input type="date" name="d" value="{selected}">
+            <input class="search" type="text" name="q" value="{html.escape(search)}" placeholder="Caută șofer...">
+            <button class="primary" type="submit">Afișează</button>
+            <a class="btn-light" href="/admin?d={selected}">Reset</a>
+        </form>
+    </div>
 </section>
 
 <section class="panel">
-<table>
-<thead>
-<tr>
-<th>Șofer</th>
-<th>Status</th>
-<th>FICO</th>
-<th>Ora</th>
-<th>Dovadă</th>
-</tr>
-</thead>
-<tbody>
-{table_rows}
-</tbody>
-</table>
+    <div class="import-title">Lista zilnică din Cortex</div>
+    <form class="control-group" action="/admin/upload" method="post" enctype="multipart/form-data">
+        <input type="date" name="work_date" value="{selected}" required>
+        <input type="file" name="file" accept=".xlsx" required>
+        <button class="primary" type="submit">Încarcă Excel Cortex</button>
+    </form>
+    <div class="helper">Aplicația extrage automat șoferii din coloana „Name des Fahrers”.</div>
 </section>
+
+<section class="panel table-wrap">
+    {table_content}
+</section>
+
 </main>
+
+<script>
+const missingNames = `{missing_js}`;
+
+async function copyMissing() {{
+    const message = missingNames.trim();
+
+    if (!message) {{
+        alert("Toți șoferii au trimis scorul FICO.");
+        return;
+    }}
+
+    try {{
+        await navigator.clipboard.writeText(message);
+        const el = document.getElementById("copyOk");
+        el.classList.add("show");
+        setTimeout(() => el.classList.remove("show"), 1800);
+    }} catch (e) {{
+        window.prompt("Copiază lista:", message);
+    }}
+}}
+</script>
+
 </body>
 </html>
 """
+
     return HTMLResponse(page)
 
 
-@app.get("/admin/export")
-def export_day(d: str | None = None):
+@app.get("/admin/export.xlsx")
+def export_day_excel(d: str | None = None):
     selected = d or date.today().isoformat()
     conn = db()
 
     rows = conn.execute("""
         SELECT d.name,
                CASE WHEN s.id IS NULL THEN 'Nu a trimis' ELSE 'Trimis' END AS status,
-               COALESCE(s.fico_score, '') AS fico_score,
-               COALESCE(s.submitted_at, '') AS submitted_at,
+               s.fico_score,
+               s.submitted_at,
+               COALESCE(s.entered_full_name, '') AS entered_full_name,
                COALESCE(s.proof_filename, '') AS proof_filename
         FROM daily_required r
         JOIN drivers d ON d.id = r.driver_id
@@ -780,31 +904,89 @@ def export_day(d: str | None = None):
           ON s.driver_id = d.id
          AND s.work_date = r.work_date
         WHERE r.work_date = ?
-        ORDER BY status, d.name
+        ORDER BY
+            CASE WHEN s.id IS NULL THEN 0 ELSE 1 END ASC,
+            d.name ASC
     """, (selected,)).fetchall()
 
     conn.close()
 
-    out = io.StringIO()
-    writer = csv.writer(out)
-    writer.writerow(["Driver", "Status", "FICO", "Submitted at", "Proof"])
+    workbook = openpyxl.Workbook()
+    ws = workbook.active
+    ws.title = "FICO"
 
-    for r in rows:
-        writer.writerow([
-            r["name"],
-            r["status"],
-            r["fico_score"],
-            r["submitted_at"],
-            r["proof_filename"]
+    headers = [
+        "Șofer",
+        "Status",
+        "FICO",
+        "Ora trimiterii",
+        "Nume introdus",
+        "Dovadă"
+    ]
+    ws.append(headers)
+
+    for row in rows:
+        proof = f"/proof/{row['proof_filename']}" if row["proof_filename"] else ""
+        ws.append([
+            row["name"],
+            row["status"],
+            row["fico_score"] if row["fico_score"] is not None else "",
+            row["submitted_at"] or "",
+            row["entered_full_name"],
+            proof
         ])
 
-    out.seek(0)
+    from openpyxl.styles import Font, PatternFill, Alignment
+
+    header_fill = PatternFill("solid", fgColor="17212B")
+    header_font = Font(color="FFFFFF", bold=True)
+
+    for cell in ws[1]:
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(vertical="center")
+
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = ws.dimensions
+
+    widths = {
+        "A": 30,
+        "B": 16,
+        "C": 12,
+        "D": 23,
+        "E": 30,
+        "F": 30
+    }
+
+    for col, width in widths.items():
+        ws.column_dimensions[col].width = width
+
+    missing_fill = PatternFill("solid", fgColor="FDEEEE")
+    low_fill = PatternFill("solid", fgColor="F4CCCC")
+
+    for row_idx in range(2, ws.max_row + 1):
+        status = ws[f"B{row_idx}"].value
+        score = ws[f"C{row_idx}"].value
+
+        if status == "Nu a trimis":
+            for col_idx in range(1, 7):
+                ws.cell(row=row_idx, column=col_idx).fill = missing_fill
+
+        if isinstance(score, int) and score < 800:
+            ws[f"C{row_idx}"].fill = low_fill
+            ws[f"C{row_idx}"].font = Font(bold=True)
+
+    output = io.BytesIO()
+    workbook.save(output)
+    output.seek(0)
+
+    filename = f"FICO_{selected}.xlsx"
 
     return StreamingResponse(
-        iter([out.getvalue()]),
-        media_type="text/csv",
+        output,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={
             "Content-Disposition":
-            f'attachment; filename="fico_{selected}.csv"'
+            f'attachment; filename="{filename}"'
         }
     )
