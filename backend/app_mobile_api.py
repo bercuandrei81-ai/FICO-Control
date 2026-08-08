@@ -259,6 +259,13 @@ def init_db():
             used INTEGER DEFAULT 0
         );
 
+        CREATE TABLE IF NOT EXISTS daily_list_imports(
+            work_date TEXT PRIMARY KEY,
+            imported_at TEXT NOT NULL,
+            source_filename TEXT,
+            driver_count INTEGER NOT NULL DEFAULT 0
+        );
+
         CREATE INDEX IF NOT EXISTS idx_daily_required_work_date
             ON daily_required(work_date);
 
@@ -341,6 +348,13 @@ def init_db():
             expires_at TEXT NOT NULL,
             used INTEGER DEFAULT 0
         );
+
+        CREATE TABLE IF NOT EXISTS daily_list_imports(
+            work_date TEXT PRIMARY KEY,
+            imported_at TEXT NOT NULL,
+            source_filename TEXT,
+            driver_count INTEGER NOT NULL DEFAULT 0
+        );
         """)
 
     ensure_column(conn, "submissions", "entered_full_name", "TEXT")
@@ -408,6 +422,35 @@ def health_db():
             "database": DB_BACKEND,
             "error": type(exc).__name__
         }
+
+
+@app.get("/health/daily-list")
+def health_daily_list(d: str | None = None):
+    selected = d or date.today().isoformat()
+    conn = db()
+    try:
+        row = conn.execute(
+            "SELECT COUNT(*) AS c FROM daily_required WHERE work_date=?",
+            (selected,)
+        ).fetchone()
+        meta = conn.execute(
+            """
+            SELECT imported_at, source_filename, driver_count
+            FROM daily_list_imports
+            WHERE work_date=?
+            """,
+            (selected,)
+        ).fetchone()
+
+        return {
+            "ok": True,
+            "date": selected,
+            "driver_count": int(row["c"] if row else 0),
+            "saved": bool(row and int(row["c"]) > 0),
+            "imported_at": meta["imported_at"] if meta else None
+        }
+    finally:
+        conn.close()
 
 
 @app.get("/health/storage")
@@ -2131,6 +2174,35 @@ async def upload_daily_list(
             "INSERT OR IGNORE INTO daily_required(work_date, driver_id) VALUES(?,?)",
             (work_date, driver["id"])
         )
+
+    # Persist metadata for this day's Excel list. The list itself is already
+    # stored in daily_required by work_date and survives logout/redeploy.
+    _daily_count_row = conn.execute(
+        "SELECT COUNT(*) AS c FROM daily_required WHERE work_date=?",
+        (work_date,)
+    ).fetchone()
+    _daily_count = int(_daily_count_row["c"] if _daily_count_row else 0)
+    _source_filename = getattr(file, "filename", None)
+
+    conn.execute(
+        """
+        INSERT INTO daily_list_imports(
+            work_date, imported_at, source_filename, driver_count
+        )
+        VALUES(?,?,?,?)
+        ON CONFLICT(work_date) DO UPDATE SET
+            imported_at=excluded.imported_at,
+            source_filename=excluded.source_filename,
+            driver_count=excluded.driver_count
+        """,
+        (
+            work_date,
+            datetime.now(timezone.utc).isoformat(),
+            _source_filename,
+            _daily_count
+        )
+    )
+
 
     conn.commit()
     conn.close()
