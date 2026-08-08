@@ -273,6 +273,25 @@ def init_db():
             driver_count INTEGER NOT NULL DEFAULT 0
         );
 
+
+        CREATE TABLE IF NOT EXISTS mentor_required(
+            work_date TEXT NOT NULL,
+            driver_name TEXT NOT NULL,
+            normalized_name TEXT NOT NULL,
+            imported_at TEXT NOT NULL,
+            source_filename TEXT,
+            PRIMARY KEY(work_date, normalized_name)
+        );
+
+        CREATE TABLE IF NOT EXISTS mentor_connected(
+            work_date TEXT NOT NULL,
+            driver_name TEXT NOT NULL,
+            normalized_name TEXT NOT NULL,
+            imported_at TEXT NOT NULL,
+            source_filename TEXT,
+            PRIMARY KEY(work_date, normalized_name)
+        );
+
         CREATE INDEX IF NOT EXISTS idx_daily_required_work_date
             ON daily_required(work_date);
 
@@ -361,6 +380,25 @@ def init_db():
             imported_at TEXT NOT NULL,
             source_filename TEXT,
             driver_count INTEGER NOT NULL DEFAULT 0
+        );
+
+
+        CREATE TABLE IF NOT EXISTS mentor_required(
+            work_date TEXT NOT NULL,
+            driver_name TEXT NOT NULL,
+            normalized_name TEXT NOT NULL,
+            imported_at TEXT NOT NULL,
+            source_filename TEXT,
+            PRIMARY KEY(work_date, normalized_name)
+        );
+
+        CREATE TABLE IF NOT EXISTS mentor_connected(
+            work_date TEXT NOT NULL,
+            driver_name TEXT NOT NULL,
+            normalized_name TEXT NOT NULL,
+            imported_at TEXT NOT NULL,
+            source_filename TEXT,
+            PRIMARY KEY(work_date, normalized_name)
         );
         """)
 
@@ -2159,6 +2197,374 @@ def extract_driver_names_from_xlsx(raw: bytes) -> list[str]:
     return names
 
 
+def mentor_name_key(value: str) -> str:
+    """Normalize a person's name independent of first/last-name order."""
+    cleaned = normalize_name(value or "")
+    tokens = [token for token in cleaned.split() if token]
+    return " ".join(sorted(tokens))
+
+
+def extract_mentor_names_from_xlsx(raw: bytes) -> list[str]:
+    """Read Mentor Shift Report and return unique connected drivers."""
+    workbook = openpyxl.load_workbook(
+        io.BytesIO(raw),
+        read_only=True,
+        data_only=True
+    )
+    ws = workbook[workbook.sheetnames[0]]
+    rows = ws.iter_rows(values_only=True)
+    headers = next(rows, None)
+    if not headers:
+        return []
+
+    header_map = {
+        str(value).strip().lower(): index
+        for index, value in enumerate(headers)
+        if value is not None
+    }
+
+    first_index = header_map.get("first name")
+    last_index = header_map.get("last name")
+
+    if first_index is None or last_index is None:
+        raise ValueError("mentor_name_columns_not_found")
+
+    names = []
+    seen = set()
+
+    for row in rows:
+        first = ""
+        last = ""
+        if first_index < len(row) and row[first_index] is not None:
+            first = str(row[first_index]).strip()
+        if last_index < len(row) and row[last_index] is not None:
+            last = str(row[last_index]).strip()
+
+        name = " ".join(part for part in (first, last) if part).strip()
+        if not name:
+            continue
+
+        key = mentor_name_key(name)
+        if key and key not in seen:
+            seen.add(key)
+            names.append(name)
+
+    return names
+
+
+def mentor_compare(required_name: str, connected_names: list[str]):
+    """Return connected/review/missing plus best Mentor name and confidence."""
+    required_key = mentor_name_key(required_name)
+    if not required_key:
+        return "missing", None, 0.0
+
+    exact = {mentor_name_key(name): name for name in connected_names}
+    if required_key in exact:
+        return "connected", exact[required_key], 1.0
+
+    required_tokens = set(required_key.split())
+    best_name = None
+    best_score = 0.0
+
+    for candidate in connected_names:
+        candidate_key = mentor_name_key(candidate)
+        candidate_tokens = set(candidate_key.split())
+
+        sequence_score = SequenceMatcher(None, required_key, candidate_key).ratio()
+        union = required_tokens | candidate_tokens
+        token_score = (
+            len(required_tokens & candidate_tokens) / len(union)
+            if union else 0.0
+        )
+        score = max(sequence_score, sequence_score * 0.65 + token_score * 0.35)
+
+        if score > best_score:
+            best_score = score
+            best_name = candidate
+
+    if best_score >= 0.88:
+        return "connected", best_name, best_score
+    if best_score >= 0.72:
+        return "review", best_name, best_score
+    return "missing", best_name, best_score
+
+
+@app.post("/admin/mentor/upload-cortex")
+async def mentor_upload_cortex(
+    work_date: str = Form(...),
+    file: UploadFile = File(...)
+):
+    filename = (file.filename or "").lower()
+    if not filename.endswith(".xlsx"):
+        return RedirectResponse(
+            f"/admin/mentor?d={work_date}&error=cortex",
+            status_code=303
+        )
+
+    raw = await file.read()
+    try:
+        # This existing function already applies the user's rescue rule:
+        # for Name des Fahrers values separated with |, only the first driver counts.
+        names = extract_driver_names_from_xlsx(raw)
+    except Exception:
+        return RedirectResponse(
+            f"/admin/mentor?d={work_date}&error=cortex",
+            status_code=303
+        )
+
+    conn = db()
+    conn.execute("DELETE FROM mentor_required WHERE work_date=?", (work_date,))
+    imported_at = datetime.now(timezone.utc).isoformat()
+
+    for name in names:
+        key = mentor_name_key(name)
+        if not key:
+            continue
+        conn.execute(
+            """
+            INSERT INTO mentor_required(
+                work_date, driver_name, normalized_name, imported_at, source_filename
+            ) VALUES(?,?,?,?,?)
+            ON CONFLICT(work_date, normalized_name) DO UPDATE SET
+                driver_name=excluded.driver_name,
+                imported_at=excluded.imported_at,
+                source_filename=excluded.source_filename
+            """,
+            (work_date, name, key, imported_at, file.filename)
+        )
+
+    conn.commit()
+    conn.close()
+    return RedirectResponse(f"/admin/mentor?d={work_date}", status_code=303)
+
+
+@app.post("/admin/mentor/upload-shift")
+async def mentor_upload_shift(
+    work_date: str = Form(...),
+    file: UploadFile = File(...)
+):
+    filename = (file.filename or "").lower()
+    if not filename.endswith(".xlsx"):
+        return RedirectResponse(
+            f"/admin/mentor?d={work_date}&error=mentor",
+            status_code=303
+        )
+
+    raw = await file.read()
+    try:
+        names = extract_mentor_names_from_xlsx(raw)
+    except Exception:
+        return RedirectResponse(
+            f"/admin/mentor?d={work_date}&error=mentor",
+            status_code=303
+        )
+
+    conn = db()
+    conn.execute("DELETE FROM mentor_connected WHERE work_date=?", (work_date,))
+    imported_at = datetime.now(timezone.utc).isoformat()
+
+    for name in names:
+        key = mentor_name_key(name)
+        if not key:
+            continue
+        conn.execute(
+            """
+            INSERT INTO mentor_connected(
+                work_date, driver_name, normalized_name, imported_at, source_filename
+            ) VALUES(?,?,?,?,?)
+            ON CONFLICT(work_date, normalized_name) DO UPDATE SET
+                driver_name=excluded.driver_name,
+                imported_at=excluded.imported_at,
+                source_filename=excluded.source_filename
+            """,
+            (work_date, name, key, imported_at, file.filename)
+        )
+
+    conn.commit()
+    conn.close()
+    return RedirectResponse(f"/admin/mentor?d={work_date}", status_code=303)
+
+
+@app.get("/admin/mentor", response_class=HTMLResponse)
+def mentor_check_page(request: Request, d: str | None = None):
+    selected = d or date.today().isoformat()
+
+    conn = db()
+    required_rows = conn.execute(
+        "SELECT driver_name FROM mentor_required WHERE work_date=? ORDER BY driver_name",
+        (selected,)
+    ).fetchall()
+    mentor_rows = conn.execute(
+        "SELECT driver_name FROM mentor_connected WHERE work_date=? ORDER BY driver_name",
+        (selected,)
+    ).fetchall()
+    conn.close()
+
+    required_names = [row["driver_name"] for row in required_rows]
+    mentor_names = [row["driver_name"] for row in mentor_rows]
+
+    results = []
+    for required_name in required_names:
+        status, matched_name, confidence = mentor_compare(required_name, mentor_names)
+        results.append({
+            "name": required_name,
+            "status": status,
+            "matched_name": matched_name,
+            "confidence": confidence
+        })
+
+    connected_count = sum(row["status"] == "connected" for row in results)
+    review_count = sum(row["status"] == "review" for row in results)
+    missing = [row for row in results if row["status"] == "missing"]
+
+    table_rows = ""
+    for row in results:
+        if row["status"] == "connected":
+            badge = '<span class="badge ok">Conectat</span>'
+        elif row["status"] == "review":
+            badge = '<span class="badge review">Verificare</span>'
+        else:
+            badge = '<span class="badge missing">Nu s-a conectat</span>'
+
+        mentor_match = "—"
+        if row["matched_name"] and row["status"] != "missing":
+            mentor_match = html.escape(row["matched_name"])
+            if row["confidence"] < 0.999:
+                mentor_match += f' <span class="confidence">{round(row["confidence"] * 100)}%</span>'
+
+        table_rows += f"""
+        <tr>
+          <td><strong>{html.escape(row['name'])}</strong></td>
+          <td>{badge}</td>
+          <td>{mentor_match}</td>
+        </tr>
+        """
+
+    if not results:
+        table_rows = '<tr><td class="empty" colspan="3">Încarcă lista Cortex pentru această zi.</td></tr>'
+
+    missing_text = "\\n".join(row["name"] for row in missing).replace("`", "\\`")
+
+    page = f"""
+<!doctype html>
+<html lang="ro">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Mentor Check · FICO Control</title>
+<style>
+*{{box-sizing:border-box}}
+body{{margin:0;background:#f4f6f8;color:#17212b;font-family:Arial,sans-serif}}
+.wrap{{max-width:1280px;margin:0 auto;padding:28px 18px 60px}}
+.topbar{{display:flex;justify-content:space-between;align-items:center;gap:16px;margin-bottom:22px}}
+.brand{{font-size:13px;font-weight:900;letter-spacing:2px}}
+h1{{font-size:38px;margin:5px 0 0}}
+.actions{{display:flex;gap:9px;align-items:center;flex-wrap:wrap}}
+.btn{{border:0;border-radius:11px;padding:12px 16px;font-weight:800;text-decoration:none;cursor:pointer;display:inline-flex;align-items:center;justify-content:center}}
+.btn-dark{{background:#17212b;color:#fff}}
+.btn-light{{background:#fff;color:#17212b;border:1px solid #d8dde3}}
+.date-row{{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:16px;flex-wrap:wrap}}
+.date-form{{display:flex;gap:9px;align-items:center}}
+input[type=date],input[type=file]{{border:1px solid #d8dde3;border-radius:10px;padding:11px;background:#fff;max-width:100%}}
+.stats{{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:18px}}
+.stat{{background:#fff;border:1px solid #e4e7ec;border-radius:16px;padding:18px}}
+.stat strong{{display:block;font-size:31px;margin-bottom:4px}}
+.stat span{{font-size:13px;color:#667085;font-weight:700}}
+.uploads{{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:18px}}
+.panel{{background:#fff;border:1px solid #e4e7ec;border-radius:18px;padding:20px}}
+.panel h2{{margin:0 0 7px;font-size:20px}}
+.panel p{{margin:0 0 16px;color:#667085;font-size:13px;line-height:1.5}}
+.upload-form{{display:flex;gap:10px;flex-wrap:wrap;align-items:center}}
+.table-panel{{background:#fff;border:1px solid #e4e7ec;border-radius:18px;overflow:hidden}}
+table{{width:100%;border-collapse:collapse}}
+th,td{{padding:14px 16px;text-align:left;border-bottom:1px solid #eef0f2}}
+th{{font-size:12px;color:#667085;background:#fafafa}}
+.badge{{display:inline-block;padding:6px 10px;border-radius:999px;font-size:12px;font-weight:900}}
+.ok{{background:#e9f8ef;color:#147a42}}
+.missing{{background:#fff0f0;color:#b42318}}
+.review{{background:#fff7e6;color:#9a6700}}
+.confidence{{color:#667085;font-size:11px;font-weight:700}}
+.empty{{padding:32px;text-align:center;color:#667085}}
+@media(max-width:850px){{.stats{{grid-template-columns:1fr 1fr}}.uploads{{grid-template-columns:1fr}}.topbar{{display:block}}.actions{{margin-top:15px}}}}
+@media(max-width:520px){{.stats{{grid-template-columns:1fr}}h1{{font-size:31px}}}}
+</style>
+</head>
+<body>
+<main class="wrap">
+  <div class="topbar">
+    <div>
+      <div class="brand">FICO CONTROL</div>
+      <h1>Mentor Check</h1>
+      <div style="margin-top:7px;color:#667085;font-size:13px">Compară lista Cortex cu Mentor Shift Report</div>
+    </div>
+    <div class="actions">
+      <a class="btn btn-light" href="/admin?d={selected}">FICO Dashboard</a>
+      <a class="btn btn-light" href="/admin/owner">Owner</a>
+      <button class="btn btn-dark" type="button" onclick="copyMissing()">Copiază șoferii lipsă</button>
+    </div>
+  </div>
+
+  <div class="date-row">
+    <form class="date-form" method="get" action="/admin/mentor">
+      <input type="date" name="d" value="{selected}">
+      <button class="btn btn-dark" type="submit">Afișează</button>
+    </form>
+    <strong>{selected}</strong>
+  </div>
+
+  <section class="stats">
+    <div class="stat"><strong>{len(required_names)}</strong><span>Trebuie conectați</span></div>
+    <div class="stat"><strong>{connected_count}</strong><span>Conectați în Mentor</span></div>
+    <div class="stat"><strong>{len(missing)}</strong><span>Nu s-au conectat</span></div>
+    <div class="stat"><strong>{review_count}</strong><span>Necesită verificare</span></div>
+  </section>
+
+  <section class="uploads">
+    <div class="panel">
+      <h2>1. Cortex</h2>
+      <p>Lista tuturor șoferilor care lucrează. Pentru „Name des Fahrers” cu mai multe nume separate prin |, se ia numai primul șofer.</p>
+      <form class="upload-form" method="post" action="/admin/mentor/upload-cortex" enctype="multipart/form-data">
+        <input type="hidden" name="work_date" value="{selected}">
+        <input type="file" name="file" accept=".xlsx" required>
+        <button class="btn btn-dark" type="submit">Încarcă Cortex</button>
+      </form>
+    </div>
+
+    <div class="panel">
+      <h2>2. Mentor Shift Report</h2>
+      <p>Lista celor care s-au conectat. Dacă același șofer apare de mai multe ori, este considerat o singură persoană conectată.</p>
+      <form class="upload-form" method="post" action="/admin/mentor/upload-shift" enctype="multipart/form-data">
+        <input type="hidden" name="work_date" value="{selected}">
+        <input type="file" name="file" accept=".xlsx" required>
+        <button class="btn btn-dark" type="submit">Încarcă Mentor</button>
+      </form>
+    </div>
+  </section>
+
+  <section class="table-panel">
+    <table>
+      <thead><tr><th>ȘOFER CORTEX</th><th>STATUS MENTOR</th><th>POTRIVIRE MENTOR</th></tr></thead>
+      <tbody>{table_rows}</tbody>
+    </table>
+  </section>
+</main>
+<script>
+async function copyMissing() {{
+  const text = `{missing_text}`;
+  try {{
+    await navigator.clipboard.writeText(text);
+    alert(text ? "Lista șoferilor lipsă a fost copiată." : "Nu există șoferi lipsă.");
+  }} catch (e) {{
+    alert("Nu am putut copia lista.");
+  }}
+}}
+</script>
+</body>
+</html>
+"""
+    return HTMLResponse(page)
+
+
 @app.post("/admin/upload")
 async def upload_daily_list(
     work_date: str = Form(...),
@@ -3105,6 +3511,7 @@ th{{font-size:13px;color:#667085;text-transform:uppercase;letter-spacing:.4px}}
     </div>
 
     <div class="top-actions">
+        <a class="btn-light" href="/admin/mentor?d={selected}">Mentor Check</a>
         <a class="btn-light" href="/admin/owner">Owner</a>
         <form method="post" action="/admin/logout" style="margin:0">
             <button class="btn-light" type="submit">Ieșire</button>
