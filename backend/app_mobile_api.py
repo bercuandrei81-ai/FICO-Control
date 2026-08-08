@@ -30,6 +30,12 @@ R2_ACCESS_KEY_ID = os.getenv("R2_ACCESS_KEY_ID", "").strip()
 R2_SECRET_ACCESS_KEY = os.getenv("R2_SECRET_ACCESS_KEY", "").strip()
 R2_ENDPOINT = os.getenv("R2_ENDPOINT", "").strip().rstrip("/")
 R2_BUCKET_NAME = os.getenv("R2_BUCKET_NAME", "").strip()
+
+MR_LOGISTICS_LOGO = os.path.join(
+    os.path.dirname(__file__),
+    "ChatGPT Image 8. Aug. 2026, 15_20_51.png"
+)
+
 R2_ENABLED = all([
     R2_ACCESS_KEY_ID,
     R2_SECRET_ACCESS_KEY,
@@ -407,6 +413,17 @@ def db_healthcheck():
 
 
 init_db()
+
+
+@app.get("/brand-logo")
+def brand_logo():
+    if not os.path.isfile(MR_LOGISTICS_LOGO):
+        raise HTTPException(status_code=404, detail="brand_logo_not_found")
+    return FileResponse(
+        MR_LOGISTICS_LOGO,
+        media_type="image/png",
+        headers={"Cache-Control": "public, max-age=3600"}
+    )
 
 
 @app.get("/health/db")
@@ -823,6 +840,8 @@ body{{margin:0;background:#f4f6f8;font-family:Arial,sans-serif;color:#17212b}}
 .wrap{{width:min(92%,470px);margin:65px auto}}
 .card{{background:#fff;border-radius:22px;padding:30px;box-shadow:0 12px 35px rgba(0,0,0,.08)}}
 .brand{{font-size:13px;font-weight:900;letter-spacing:2px}}
+.login-logo-wrap{{display:flex;justify-content:center;margin:2px 0 18px}}
+.login-logo{{display:block;width:min(230px,75%);height:auto;object-fit:contain}}
 h1{{font-size:31px;margin:22px 0 8px}}
 .subtitle{{color:#667085;line-height:1.5;margin-bottom:22px}}
 label{{display:block;font-weight:800;margin:16px 0 7px}}
@@ -848,6 +867,10 @@ button{{margin-top:22px;border:0;background:#17212b;color:#fff;font-weight:800;c
 <button type="button" data-lang="ro" class="active">RO</button>
 <button type="button" data-lang="de">DE</button>
 <button type="button" data-lang="en">EN</button>
+</div>
+
+<div class="login-logo-wrap">
+<img class="login-logo" src="/brand-logo" alt="MR Logistics">
 </div>
 
 <div class="brand">FICO CONTROL</div>
