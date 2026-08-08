@@ -1313,15 +1313,15 @@ def admin_owner_page(request: Request):
     active = conn.execute("""
         SELECT display_name,
                normalized_name,
-               created_at,
-               last_seen,
-               expires_at,
+               MIN(created_at) AS created_at,
+               MAX(last_seen) AS last_seen,
+               MAX(expires_at) AS expires_at,
                COUNT(*) AS session_count
         FROM admin_sessions
         WHERE revoked=0
           AND expires_at > ?
         GROUP BY normalized_name, display_name
-        ORDER BY last_seen DESC
+        ORDER BY MAX(last_seen) DESC
     """, (iso_utc(utc_now()),)).fetchall()
 
     blocked = conn.execute("""
