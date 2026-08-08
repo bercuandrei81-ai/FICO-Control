@@ -1,7 +1,7 @@
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse, FileResponse
 from pydantic import BaseModel
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 import sqlite3
 import io
 import csv
@@ -15,11 +15,28 @@ import json
 import urllib.request
 import urllib.parse
 import re
+import base64
+import secrets
+import hmac
+import hashlib
 
 DB = "fico.db"
 UPLOAD_DIR = "uploads"
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
 ALLOWED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/webp"}
+
+ADMIN_COOKIE_NAME = "fico_admin_session"
+ADMIN_SESSION_DAYS = 7
+OWNER_VERIFY_MINUTES = 30
+OWNER_CODE_MINUTES = 10
+
+ADMIN_INITIAL_PASSWORD = os.getenv("ADMIN_INITIAL_PASSWORD", "").strip()
+OWNER_EMAIL = os.getenv("OWNER_EMAIL", "").strip()
+RESEND_API_KEY = os.getenv("RESEND_API_KEY", "").strip()
+RESEND_FROM_EMAIL = os.getenv(
+    "RESEND_FROM_EMAIL",
+    "FICO Control <onboarding@resend.dev>"
+).strip()
 
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
@@ -82,6 +99,36 @@ def init_db():
         best_match_score REAL,
         match_reason TEXT
     );
+
+    CREATE TABLE IF NOT EXISTS admin_settings(
+        setting_key TEXT PRIMARY KEY,
+        setting_value TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS admin_sessions(
+        session_token TEXT PRIMARY KEY,
+        display_name TEXT NOT NULL,
+        normalized_name TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        last_seen TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        revoked INTEGER DEFAULT 0,
+        owner_verified_until TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS blocked_admin_names(
+        normalized_name TEXT PRIMARY KEY,
+        display_name TEXT NOT NULL,
+        blocked_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS owner_email_codes(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        code_hash TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        used INTEGER DEFAULT 0
+    );
     """)
 
     ensure_column(conn, "submissions", "entered_full_name", "TEXT")
@@ -91,11 +138,804 @@ def init_db():
     ensure_column(conn, "submissions", "verification_status", "TEXT")
     ensure_column(conn, "submissions", "name_match_score", "REAL")
 
+    existing_password = conn.execute(
+        "SELECT setting_value FROM admin_settings WHERE setting_key='shared_password_hash'"
+    ).fetchone()
+
+    if not existing_password and ADMIN_INITIAL_PASSWORD:
+        salt = secrets.token_bytes(16)
+        digest = hashlib.pbkdf2_hmac(
+            "sha256",
+            ADMIN_INITIAL_PASSWORD.encode("utf-8"),
+            salt,
+            250000
+        )
+        encoded = "pbkdf2_sha256$250000$" + base64.b64encode(salt).decode("ascii") + "$" + base64.b64encode(digest).decode("ascii")
+        conn.execute(
+            "INSERT INTO admin_settings(setting_key, setting_value) VALUES(?,?)",
+            ("shared_password_hash", encoded)
+        )
+
     conn.commit()
     conn.close()
 
 
 init_db()
+
+
+def utc_now():
+    return datetime.now(timezone.utc)
+
+
+def iso_utc(dt):
+    return dt.astimezone(timezone.utc).isoformat(timespec="seconds")
+
+
+def parse_iso_utc(value):
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def normalize_admin_name(value: str) -> str:
+    value = unicodedata.normalize("NFKD", value or "")
+    value = "".join(ch for ch in value if not unicodedata.combining(ch))
+    value = " ".join(value.strip().split())
+    return value.casefold()
+
+
+def hash_password(password: str) -> str:
+    salt = secrets.token_bytes(16)
+    iterations = 250000
+    digest = hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        salt,
+        iterations
+    )
+    return (
+        f"pbkdf2_sha256${iterations}$"
+        f"{base64.b64encode(salt).decode('ascii')}$"
+        f"{base64.b64encode(digest).decode('ascii')}"
+    )
+
+
+def verify_password(password: str, encoded: str) -> bool:
+    try:
+        algorithm, iterations_s, salt_b64, digest_b64 = encoded.split("$", 3)
+        if algorithm != "pbkdf2_sha256":
+            return False
+
+        iterations = int(iterations_s)
+        salt = base64.b64decode(salt_b64)
+        expected = base64.b64decode(digest_b64)
+
+        actual = hashlib.pbkdf2_hmac(
+            "sha256",
+            password.encode("utf-8"),
+            salt,
+            iterations
+        )
+        return hmac.compare_digest(actual, expected)
+    except Exception:
+        return False
+
+
+def get_shared_password_hash(conn):
+    row = conn.execute(
+        "SELECT setting_value FROM admin_settings WHERE setting_key='shared_password_hash'"
+    ).fetchone()
+    return row["setting_value"] if row else None
+
+
+def create_admin_session(conn, display_name: str) -> str:
+    token = secrets.token_urlsafe(36)
+    now = utc_now()
+    expires = now + timedelta(days=ADMIN_SESSION_DAYS)
+
+    conn.execute("""
+        INSERT INTO admin_sessions(
+            session_token,
+            display_name,
+            normalized_name,
+            created_at,
+            last_seen,
+            expires_at,
+            revoked
+        ) VALUES(?,?,?,?,?,?,0)
+    """, (
+        token,
+        display_name,
+        normalize_admin_name(display_name),
+        iso_utc(now),
+        iso_utc(now),
+        iso_utc(expires)
+    ))
+    conn.commit()
+    return token
+
+
+def get_valid_admin_session(token: str | None):
+    if not token:
+        return None
+
+    conn = db()
+    row = conn.execute("""
+        SELECT session_token,
+               display_name,
+               normalized_name,
+               created_at,
+               last_seen,
+               expires_at,
+               revoked,
+               owner_verified_until
+        FROM admin_sessions
+        WHERE session_token=?
+    """, (token,)).fetchone()
+
+    if not row:
+        conn.close()
+        return None
+
+    blocked = conn.execute(
+        "SELECT 1 FROM blocked_admin_names WHERE normalized_name=?",
+        (row["normalized_name"],)
+    ).fetchone()
+
+    expires = parse_iso_utc(row["expires_at"])
+    invalid = (
+        bool(row["revoked"])
+        or bool(blocked)
+        or not expires
+        or expires <= utc_now()
+    )
+
+    if invalid:
+        conn.execute(
+            "UPDATE admin_sessions SET revoked=1 WHERE session_token=?",
+            (token,)
+        )
+        conn.commit()
+        conn.close()
+        return None
+
+    conn.execute(
+        "UPDATE admin_sessions SET last_seen=? WHERE session_token=?",
+        (iso_utc(utc_now()), token)
+    )
+    conn.commit()
+    conn.close()
+    return dict(row)
+
+
+def is_owner_verified(session):
+    if not session:
+        return False
+    until = parse_iso_utc(session.get("owner_verified_until"))
+    return bool(until and until > utc_now())
+
+
+def mask_email(email: str) -> str:
+    if not email or "@" not in email:
+        return "neconfigurat"
+    local, domain = email.split("@", 1)
+    if len(local) <= 2:
+        masked_local = local[:1] + "*"
+    else:
+        masked_local = local[:2] + "*" * max(2, len(local) - 2)
+    return masked_local + "@" + domain
+
+
+def hash_owner_code(code: str) -> str:
+    return hashlib.sha256(code.encode("utf-8")).hexdigest()
+
+
+def send_owner_verification_code(code: str):
+    if not OWNER_EMAIL:
+        raise RuntimeError("OWNER_EMAIL is not configured")
+    if not RESEND_API_KEY:
+        raise RuntimeError("RESEND_API_KEY is not configured")
+
+    payload = json.dumps({
+        "from": RESEND_FROM_EMAIL,
+        "to": [OWNER_EMAIL],
+        "subject": "FICO Control - Owner verification code",
+        "html": (
+            "<div style='font-family:Arial,sans-serif'>"
+            "<h2>FICO Control</h2>"
+            "<p>Codul pentru accesul Owner este:</p>"
+            f"<div style='font-size:32px;font-weight:800;letter-spacing:5px'>{html.escape(code)}</div>"
+            f"<p>Codul expiră în {OWNER_CODE_MINUTES} minute.</p>"
+            "<p>Dacă nu ai cerut acest cod, îl poți ignora.</p>"
+            "</div>"
+        )
+    }).encode("utf-8")
+
+    req = urllib.request.Request(
+        "https://api.resend.com/emails",
+        data=payload,
+        headers={
+            "Authorization": f"Bearer {RESEND_API_KEY}",
+            "Content-Type": "application/json"
+        },
+        method="POST"
+    )
+
+    with urllib.request.urlopen(req, timeout=20) as response:
+        response.read()
+
+
+def owner_gate_html(message: str = "", error: bool = False):
+    message_html = ""
+    if message:
+        cls = "error" if error else "ok"
+        message_html = f'<div class="{cls}">{html.escape(message)}</div>'
+
+    return f"""
+<!doctype html>
+<html lang="ro">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>FICO Control Owner</title>
+<style>
+*{{box-sizing:border-box}}
+body{{margin:0;background:#f4f6f8;font-family:Arial,sans-serif;color:#17212b}}
+.wrap{{width:min(92%,520px);margin:55px auto}}
+.card{{background:#fff;border-radius:20px;padding:28px;box-shadow:0 10px 30px rgba(0,0,0,.08)}}
+.brand{{font-size:13px;font-weight:900;letter-spacing:2px}}
+h1{{margin:18px 0 8px;font-size:30px}}
+p{{color:#667085;line-height:1.5}}
+input,button{{width:100%;padding:14px;border-radius:11px;font-size:16px;margin-top:10px}}
+input{{border:1px solid #d8dde3}}
+button{{border:0;background:#17212b;color:#fff;font-weight:800;cursor:pointer}}
+.secondary{{background:#fff;color:#17212b;border:1px solid #d8dde3}}
+.ok,.error{{padding:12px;border-radius:10px;margin:15px 0;font-weight:700}}
+.ok{{background:#e9f8ef;color:#14804a}}
+.error{{background:#fdeeee;color:#b42318}}
+</style>
+</head>
+<body>
+<div class="wrap">
+<div class="card">
+<div class="brand">FICO CONTROL · OWNER</div>
+<h1>Confirmare prin email</h1>
+<p>Controlul Owner este protejat separat. Codul este trimis numai la <strong>{html.escape(mask_email(OWNER_EMAIL))}</strong>.</p>
+{message_html}
+<form method="post" action="/admin/owner/send-code">
+<button type="submit">Trimite codul pe email</button>
+</form>
+<form method="post" action="/admin/owner/verify-code">
+<input name="code" inputmode="numeric" maxlength="6" placeholder="Cod din 6 cifre" required>
+<button type="submit">Confirmă codul</button>
+</form>
+<a href="/admin" style="display:block;text-align:center;margin-top:16px;color:#17212b;font-weight:700">Înapoi la Admin</a>
+</div>
+</div>
+</body>
+</html>
+"""
+
+
+@app.middleware("http")
+async def protect_admin_routes(request: Request, call_next):
+    path = request.url.path
+
+    if path in ("/admin/login", "/admin/login/"):
+        return await call_next(request)
+
+    protected = path.startswith("/admin") or path.startswith("/proof/")
+
+    if not protected:
+        return await call_next(request)
+
+    token = request.cookies.get(ADMIN_COOKIE_NAME)
+    session = get_valid_admin_session(token)
+
+    if not session:
+        next_path = path
+        if request.url.query:
+            next_path += "?" + request.url.query
+        return RedirectResponse(
+            "/admin/login?next=" + urllib.parse.quote(next_path, safe=""),
+            status_code=303
+        )
+
+    request.state.admin_session = session
+    return await call_next(request)
+
+
+@app.get("/admin/login", response_class=HTMLResponse)
+def admin_login_page(request: Request, next: str | None = None, error: str | None = None):
+    current = get_valid_admin_session(request.cookies.get(ADMIN_COOKIE_NAME))
+    if current:
+        return RedirectResponse(next or "/admin", status_code=303)
+
+    configured = False
+    conn = db()
+    configured = bool(get_shared_password_hash(conn))
+    conn.close()
+
+    error_text = ""
+    if error == "invalid":
+        error_text = "Numele sau parola nu sunt corecte."
+    elif error == "blocked":
+        error_text = "Accesul pentru acest nume este blocat."
+    elif error == "name":
+        error_text = "Introdu numele tău."
+    elif not configured:
+        error_text = "Parola Admin nu este încă configurată în Render."
+
+    next_value = html.escape(next or "/admin", quote=True)
+    error_html = f'<div class="error">{html.escape(error_text)}</div>' if error_text else ""
+
+    page = f"""
+<!doctype html>
+<html lang="ro">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>FICO Control Admin Login</title>
+<style>
+*{{box-sizing:border-box}}
+body{{margin:0;background:#f4f6f8;font-family:Arial,sans-serif;color:#17212b}}
+.wrap{{width:min(92%,470px);margin:65px auto}}
+.card{{background:#fff;border-radius:22px;padding:30px;box-shadow:0 12px 35px rgba(0,0,0,.08)}}
+.brand{{font-size:13px;font-weight:900;letter-spacing:2px}}
+h1{{font-size:31px;margin:22px 0 8px}}
+.subtitle{{color:#667085;line-height:1.5;margin-bottom:22px}}
+label{{display:block;font-weight:800;margin:16px 0 7px}}
+input,button{{width:100%;padding:14px;border-radius:11px;font-size:16px}}
+input{{border:1px solid #d8dde3}}
+button{{margin-top:22px;border:0;background:#17212b;color:#fff;font-weight:800;cursor:pointer}}
+.error{{margin:14px 0;padding:12px;border-radius:10px;background:#fdeeee;color:#b42318;font-weight:700}}
+.langs{{display:flex;gap:6px;justify-content:flex-end}}
+.langs button{{width:auto;margin:0;padding:7px 9px;background:#f2f4f7;color:#667085}}
+.langs button.active{{background:#17212b;color:#fff}}
+</style>
+</head>
+<body>
+<div class="wrap">
+<div class="card">
+<div class="langs">
+<button type="button" data-lang="ro" class="active">RO</button>
+<button type="button" data-lang="de">DE</button>
+<button type="button" data-lang="en">EN</button>
+</div>
+<div class="brand">FICO CONTROL</div>
+<h1 id="title">Admin Login</h1>
+<p class="subtitle" id="subtitle">Introdu numele tău și parola comună pentru a intra în Admin Dashboard.</p>
+{error_html}
+<form method="post" action="/admin/login">
+<input type="hidden" name="next_path" value="{next_value}">
+<label id="nameLabel">Numele tău</label>
+<input name="display_name" placeholder="ex. Marius" autocomplete="name" required>
+<label id="passwordLabel">Parola</label>
+<input name="password" type="password" autocomplete="current-password" required>
+<button type="submit" id="loginButton">Intră în Admin</button>
+</form>
+</div>
+</div>
+<script>
+const T = {{
+ ro: {{title:"Admin Login",subtitle:"Introdu numele tău și parola comună pentru a intra în Admin Dashboard.",name:"Numele tău",password:"Parola",button:"Intră în Admin"}},
+ de: {{title:"Admin Login",subtitle:"Gib deinen Namen und das gemeinsame Passwort ein, um das Admin Dashboard zu öffnen.",name:"Dein Name",password:"Passwort",button:"Admin öffnen"}},
+ en: {{title:"Admin Login",subtitle:"Enter your name and the shared password to open the Admin Dashboard.",name:"Your name",password:"Password",button:"Open Admin"}}
+}};
+document.querySelectorAll("[data-lang]").forEach(btn => {{
+ btn.addEventListener("click", () => {{
+   document.querySelectorAll("[data-lang]").forEach(x => x.classList.remove("active"));
+   btn.classList.add("active");
+   const t=T[btn.dataset.lang];
+   document.getElementById("title").textContent=t.title;
+   document.getElementById("subtitle").textContent=t.subtitle;
+   document.getElementById("nameLabel").textContent=t.name;
+   document.getElementById("passwordLabel").textContent=t.password;
+   document.getElementById("loginButton").textContent=t.button;
+ }});
+}});
+</script>
+</body>
+</html>
+"""
+    return HTMLResponse(page)
+
+
+@app.post("/admin/login")
+def admin_login(
+    display_name: str = Form(...),
+    password: str = Form(...),
+    next_path: str = Form("/admin")
+):
+    clean_name = " ".join((display_name or "").strip().split())
+    if not clean_name:
+        return RedirectResponse("/admin/login?error=name", status_code=303)
+
+    normalized = normalize_admin_name(clean_name)
+    conn = db()
+
+    blocked = conn.execute(
+        "SELECT 1 FROM blocked_admin_names WHERE normalized_name=?",
+        (normalized,)
+    ).fetchone()
+
+    if blocked:
+        conn.close()
+        return RedirectResponse("/admin/login?error=blocked", status_code=303)
+
+    password_hash = get_shared_password_hash(conn)
+    if not password_hash or not verify_password(password, password_hash):
+        conn.close()
+        return RedirectResponse("/admin/login?error=invalid", status_code=303)
+
+    token = create_admin_session(conn, clean_name)
+    conn.close()
+
+    safe_next = next_path if next_path.startswith("/admin") else "/admin"
+    response = RedirectResponse(safe_next, status_code=303)
+    response.set_cookie(
+        ADMIN_COOKIE_NAME,
+        token,
+        max_age=ADMIN_SESSION_DAYS * 24 * 60 * 60,
+        httponly=True,
+        secure=True,
+        samesite="lax"
+    )
+    return response
+
+
+@app.post("/admin/logout")
+def admin_logout(request: Request):
+    token = request.cookies.get(ADMIN_COOKIE_NAME)
+    if token:
+        conn = db()
+        conn.execute(
+            "UPDATE admin_sessions SET revoked=1 WHERE session_token=?",
+            (token,)
+        )
+        conn.commit()
+        conn.close()
+
+    response = RedirectResponse("/admin/login", status_code=303)
+    response.delete_cookie(ADMIN_COOKIE_NAME)
+    return response
+
+
+@app.post("/admin/owner/send-code")
+def owner_send_code(request: Request):
+    if not OWNER_EMAIL or not RESEND_API_KEY:
+        return HTMLResponse(
+            owner_gate_html(
+                "OWNER_EMAIL sau RESEND_API_KEY nu este configurat în Render.",
+                error=True
+            ),
+            status_code=503
+        )
+
+    code = f"{secrets.randbelow(1000000):06d}"
+    now = utc_now()
+    expires = now + timedelta(minutes=OWNER_CODE_MINUTES)
+
+    conn = db()
+    conn.execute("UPDATE owner_email_codes SET used=1 WHERE used=0")
+    conn.execute("""
+        INSERT INTO owner_email_codes(
+            code_hash, created_at, expires_at, used
+        ) VALUES(?,?,?,0)
+    """, (
+        hash_owner_code(code),
+        iso_utc(now),
+        iso_utc(expires)
+    ))
+    conn.commit()
+    conn.close()
+
+    try:
+        send_owner_verification_code(code)
+    except Exception as exc:
+        return HTMLResponse(
+            owner_gate_html(
+                "Codul nu a putut fi trimis. Verifică setările de email din Render.",
+                error=True
+            ),
+            status_code=502
+        )
+
+    return HTMLResponse(
+        owner_gate_html(
+            f"Codul a fost trimis la {mask_email(OWNER_EMAIL)}."
+        )
+    )
+
+
+@app.post("/admin/owner/verify-code")
+def owner_verify_code(request: Request, code: str = Form(...)):
+    clean_code = re.sub(r"\\D", "", code or "")
+    if len(clean_code) != 6:
+        return HTMLResponse(
+            owner_gate_html("Cod invalid.", error=True),
+            status_code=400
+        )
+
+    conn = db()
+    row = conn.execute("""
+        SELECT id, code_hash, expires_at
+        FROM owner_email_codes
+        WHERE used=0
+        ORDER BY id DESC
+        LIMIT 1
+    """).fetchone()
+
+    if not row:
+        conn.close()
+        return HTMLResponse(
+            owner_gate_html("Nu există un cod activ.", error=True),
+            status_code=400
+        )
+
+    expires = parse_iso_utc(row["expires_at"])
+    valid = (
+        expires
+        and expires > utc_now()
+        and hmac.compare_digest(
+            row["code_hash"],
+            hash_owner_code(clean_code)
+        )
+    )
+
+    if not valid:
+        conn.close()
+        return HTMLResponse(
+            owner_gate_html("Codul este greșit sau a expirat.", error=True),
+            status_code=400
+        )
+
+    token = request.cookies.get(ADMIN_COOKIE_NAME)
+    owner_until = utc_now() + timedelta(minutes=OWNER_VERIFY_MINUTES)
+
+    conn.execute(
+        "UPDATE owner_email_codes SET used=1 WHERE id=?",
+        (row["id"],)
+    )
+    conn.execute(
+        "UPDATE admin_sessions SET owner_verified_until=? WHERE session_token=?",
+        (iso_utc(owner_until), token)
+    )
+    conn.commit()
+    conn.close()
+
+    return RedirectResponse("/admin/owner", status_code=303)
+
+
+@app.get("/admin/owner", response_class=HTMLResponse)
+def admin_owner_page(request: Request):
+    session = getattr(request.state, "admin_session", None)
+    if not is_owner_verified(session):
+        return HTMLResponse(owner_gate_html())
+
+    conn = db()
+    active = conn.execute("""
+        SELECT display_name,
+               normalized_name,
+               created_at,
+               last_seen,
+               expires_at,
+               COUNT(*) AS session_count
+        FROM admin_sessions
+        WHERE revoked=0
+          AND expires_at > ?
+        GROUP BY normalized_name, display_name
+        ORDER BY last_seen DESC
+    """, (iso_utc(utc_now()),)).fetchall()
+
+    blocked = conn.execute("""
+        SELECT display_name, normalized_name, blocked_at
+        FROM blocked_admin_names
+        ORDER BY blocked_at DESC
+    """).fetchall()
+    conn.close()
+
+    rows = ""
+    for r in active:
+        rows += f"""
+        <tr>
+          <td><strong>{html.escape(r["display_name"])}</strong></td>
+          <td>{html.escape(r["last_seen"][0:16].replace("T"," "))}</td>
+          <td>{r["session_count"]}</td>
+          <td>
+            <form method="post" action="/admin/owner/revoke" style="display:inline">
+              <input type="hidden" name="display_name" value="{html.escape(r["display_name"], quote=True)}">
+              <button class="small" type="submit">Deconectează</button>
+            </form>
+            <form method="post" action="/admin/owner/block" style="display:inline">
+              <input type="hidden" name="display_name" value="{html.escape(r["display_name"], quote=True)}">
+              <button class="small danger" type="submit">Blochează</button>
+            </form>
+          </td>
+        </tr>
+        """
+
+    blocked_rows = ""
+    for r in blocked:
+        blocked_rows += f"""
+        <tr>
+          <td><strong>{html.escape(r["display_name"])}</strong></td>
+          <td>{html.escape(r["blocked_at"][0:16].replace("T"," "))}</td>
+          <td>
+            <form method="post" action="/admin/owner/unblock">
+              <input type="hidden" name="display_name" value="{html.escape(r["display_name"], quote=True)}">
+              <button class="small" type="submit">Deblochează</button>
+            </form>
+          </td>
+        </tr>
+        """
+
+    page = f"""
+<!doctype html>
+<html lang="ro">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>FICO Control Owner</title>
+<style>
+*{{box-sizing:border-box}}
+body{{margin:0;background:#f4f6f8;font-family:Arial,sans-serif;color:#17212b}}
+.wrap{{width:min(95%,1100px);margin:35px auto 60px}}
+.top{{display:flex;justify-content:space-between;align-items:center;gap:15px;flex-wrap:wrap}}
+.brand{{font-size:13px;font-weight:900;letter-spacing:2px}}
+h1{{font-size:36px;margin:14px 0 25px}}
+.card{{background:#fff;border-radius:16px;padding:20px;margin-bottom:16px;box-shadow:0 5px 18px rgba(0,0,0,.05)}}
+table{{width:100%;border-collapse:collapse}}
+th,td{{text-align:left;padding:13px;border-bottom:1px solid #eceff2}}
+input,button{{padding:11px 13px;border-radius:9px;border:1px solid #d8dde3}}
+button{{cursor:pointer;font-weight:800}}
+.small{{background:#fff;color:#17212b}}
+.danger{{background:#fdeeee;color:#b42318;border-color:#f4b8b3}}
+.primary{{background:#17212b;color:#fff;border:0}}
+a{{color:#17212b;font-weight:800;text-decoration:none}}
+.password-row{{display:flex;gap:10px;flex-wrap:wrap}}
+.password-row input{{min-width:260px;flex:1}}
+</style>
+</head>
+<body>
+<main class="wrap">
+<div class="top">
+<div>
+<div class="brand">FICO CONTROL · OWNER</div>
+<h1>Control acces Admin</h1>
+</div>
+<a href="/admin">Înapoi la Dashboard</a>
+</div>
+
+<section class="card">
+<h2>Schimbă parola comună</h2>
+<p>Confirmarea Owner este valabilă temporar după codul primit pe email. Schimbarea parolei va deconecta toate celelalte sesiuni.</p>
+<form class="password-row" method="post" action="/admin/owner/change-password">
+<input type="password" name="new_password" minlength="8" placeholder="Parola nouă (minimum 8 caractere)" required>
+<button class="primary" type="submit">Schimbă parola</button>
+</form>
+</section>
+
+<section class="card">
+<h2>Persoane conectate</h2>
+<table>
+<thead><tr><th>Nume</th><th>Ultima activitate</th><th>Sesiuni</th><th>Acțiuni</th></tr></thead>
+<tbody>{rows or '<tr><td colspan="4">Nicio sesiune activă.</td></tr>'}</tbody>
+</table>
+</section>
+
+<section class="card">
+<h2>Nume blocate</h2>
+<table>
+<thead><tr><th>Nume</th><th>Blocat la</th><th>Acțiune</th></tr></thead>
+<tbody>{blocked_rows or '<tr><td colspan="3">Niciun nume blocat.</td></tr>'}</tbody>
+</table>
+</section>
+</main>
+</body>
+</html>
+"""
+    return HTMLResponse(page)
+
+
+def require_owner_verified(request: Request):
+    session = getattr(request.state, "admin_session", None)
+    if not is_owner_verified(session):
+        raise HTTPException(status_code=403, detail="owner_verification_required")
+    return session
+
+
+@app.post("/admin/owner/revoke")
+def owner_revoke_user(request: Request, display_name: str = Form(...)):
+    require_owner_verified(request)
+    normalized = normalize_admin_name(display_name)
+
+    conn = db()
+    conn.execute(
+        "UPDATE admin_sessions SET revoked=1 WHERE normalized_name=?",
+        (normalized,)
+    )
+    conn.commit()
+    conn.close()
+    return RedirectResponse("/admin/owner", status_code=303)
+
+
+@app.post("/admin/owner/block")
+def owner_block_user(request: Request, display_name: str = Form(...)):
+    require_owner_verified(request)
+    clean = " ".join((display_name or "").strip().split())
+    normalized = normalize_admin_name(clean)
+
+    conn = db()
+    conn.execute("""
+        INSERT INTO blocked_admin_names(
+            normalized_name, display_name, blocked_at
+        ) VALUES(?,?,?)
+        ON CONFLICT(normalized_name) DO UPDATE SET
+            display_name=excluded.display_name,
+            blocked_at=excluded.blocked_at
+    """, (normalized, clean, iso_utc(utc_now())))
+    conn.execute(
+        "UPDATE admin_sessions SET revoked=1 WHERE normalized_name=?",
+        (normalized,)
+    )
+    conn.commit()
+    conn.close()
+    return RedirectResponse("/admin/owner", status_code=303)
+
+
+@app.post("/admin/owner/unblock")
+def owner_unblock_user(request: Request, display_name: str = Form(...)):
+    require_owner_verified(request)
+    normalized = normalize_admin_name(display_name)
+
+    conn = db()
+    conn.execute(
+        "DELETE FROM blocked_admin_names WHERE normalized_name=?",
+        (normalized,)
+    )
+    conn.commit()
+    conn.close()
+    return RedirectResponse("/admin/owner", status_code=303)
+
+
+@app.post("/admin/owner/change-password")
+def owner_change_password(
+    request: Request,
+    new_password: str = Form(...)
+):
+    session = require_owner_verified(request)
+
+    if len(new_password) < 8:
+        raise HTTPException(
+            status_code=400,
+            detail="password_must_have_at_least_8_characters"
+        )
+
+    token = request.cookies.get(ADMIN_COOKIE_NAME)
+    conn = db()
+    conn.execute("""
+        INSERT INTO admin_settings(setting_key, setting_value)
+        VALUES('shared_password_hash', ?)
+        ON CONFLICT(setting_key) DO UPDATE SET
+            setting_value=excluded.setting_value
+    """, (hash_password(new_password),))
+
+    conn.execute(
+        "UPDATE admin_sessions SET revoked=1 WHERE session_token<>?",
+        (token,)
+    )
+    conn.commit()
+    conn.close()
+
+    return RedirectResponse("/admin/owner", status_code=303)
+
 
 
 
@@ -1076,7 +1916,7 @@ applyLanguage(detectInitialLanguage());
 
 
 @app.get("/admin", response_class=HTMLResponse)
-def admin_page(d: str | None = None, q: str | None = None):
+def admin_page(request: Request, d: str | None = None, q: str | None = None):
     selected = d or date.today().isoformat()
     search = (q or "").strip()
 
@@ -1396,9 +2236,16 @@ th{{font-size:13px;color:#667085;text-transform:uppercase;letter-spacing:.4px}}
     <div>
         <div class="brand">FICO CONTROL</div>
         <h1>Admin Dashboard</h1>
+        <div style="margin-top:8px;color:#667085;font-size:13px">
+            Conectat ca: <strong>{html.escape(getattr(request.state, "admin_session", {}).get("display_name", "Admin"))}</strong>
+        </div>
     </div>
 
     <div class="top-actions">
+        <a class="btn-light" href="/admin/owner">Owner</a>
+        <form method="post" action="/admin/logout" style="margin:0">
+            <button class="btn-light" type="submit">Ieșire</button>
+        </form>
         <a class="btn-light" href="/admin/export.xlsx?d={selected}">Export Excel</a>
         <button class="btn" type="button" onclick="copyMissing()">Copiază șoferii lipsă</button>
         <span id="copyOk" class="copy-ok">Copiat</span>
