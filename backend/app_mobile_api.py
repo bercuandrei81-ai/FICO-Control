@@ -25,6 +25,17 @@ DB = "fico.db"
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 DB_BACKEND = "postgresql" if DATABASE_URL else "sqlite"
 
+R2_ACCESS_KEY_ID = os.getenv("R2_ACCESS_KEY_ID", "").strip()
+R2_SECRET_ACCESS_KEY = os.getenv("R2_SECRET_ACCESS_KEY", "").strip()
+R2_ENDPOINT = os.getenv("R2_ENDPOINT", "").strip().rstrip("/")
+R2_BUCKET_NAME = os.getenv("R2_BUCKET_NAME", "").strip()
+R2_ENABLED = all([
+    R2_ACCESS_KEY_ID,
+    R2_SECRET_ACCESS_KEY,
+    R2_ENDPOINT,
+    R2_BUCKET_NAME
+])
+
 UPLOAD_DIR = "uploads"
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
 ALLOWED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/webp"}
@@ -43,6 +54,31 @@ RESEND_FROM_EMAIL = os.getenv(
 ).strip()
 
 os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+
+def r2_client():
+    if not R2_ENABLED:
+        return None
+
+    import boto3
+    from botocore.config import Config
+
+    return boto3.client(
+        "s3",
+        endpoint_url=R2_ENDPOINT,
+        aws_access_key_id=R2_ACCESS_KEY_ID,
+        aws_secret_access_key=R2_SECRET_ACCESS_KEY,
+        region_name="auto",
+        config=Config(
+            signature_version="s3v4",
+            retries={"max_attempts": 3, "mode": "standard"}
+        )
+    )
+
+
+def storage_backend_name():
+    return "r2" if R2_ENABLED else "local"
+
 
 app = FastAPI(title="FICO Control")
 
@@ -370,6 +406,38 @@ def health_db():
         return {
             "ok": False,
             "database": DB_BACKEND,
+            "error": type(exc).__name__
+        }
+
+
+@app.get("/health/storage")
+def health_storage():
+    if not R2_ENABLED:
+        return {
+            "ok": False,
+            "storage": "local",
+            "error": "r2_not_configured"
+        }
+
+    try:
+        client = r2_client()
+        client.head_bucket(Bucket=R2_BUCKET_NAME)
+        return {
+            "ok": True,
+            "storage": "r2",
+            "bucket": R2_BUCKET_NAME
+        }
+    except Exception as exc:
+        print(
+            "R2_HEALTH_ERROR:",
+            type(exc).__name__,
+            str(exc)[:500],
+            flush=True
+        )
+        return {
+            "ok": False,
+            "storage": "r2",
+            "bucket": R2_BUCKET_NAME,
             "error": type(exc).__name__
         }
 
@@ -1690,12 +1758,38 @@ async def save_proof_image(proof: UploadFile) -> tuple[str, str, bytes]:
     }[proof.content_type]
 
     filename = f"{uuid.uuid4().hex}{extension}"
-    path = os.path.join(UPLOAD_DIR, filename)
+    original_name = proof.filename or "proof"
 
-    with open(path, "wb") as f:
-        f.write(raw)
+    if R2_ENABLED:
+        try:
+            client = r2_client()
+            client.put_object(
+                Bucket=R2_BUCKET_NAME,
+                Key=filename,
+                Body=raw,
+                ContentType=proof.content_type,
+                Metadata={
+                    "original-name": original_name[:500]
+                }
+            )
+        except Exception as exc:
+            print(
+                "R2_UPLOAD_ERROR:",
+                type(exc).__name__,
+                str(exc)[:500],
+                flush=True
+            )
+            raise HTTPException(
+                status_code=502,
+                detail="proof_storage_error"
+            )
+    else:
+        # Local fallback for development only.
+        path = os.path.join(UPLOAD_DIR, filename)
+        with open(path, "wb") as f:
+            f.write(raw)
 
-    return filename, (proof.filename or "proof"), raw
+    return filename, original_name, raw
 
 
 class SubmissionIn(BaseModel):
@@ -2131,8 +2225,54 @@ async def submit_web(
 
 @app.get("/proof/{filename}")
 def proof_image(filename: str):
-    # Prevent path traversal.
     safe_name = os.path.basename(filename)
+
+    if R2_ENABLED:
+        try:
+            client = r2_client()
+            response = client.get_object(
+                Bucket=R2_BUCKET_NAME,
+                Key=safe_name
+            )
+
+            content_type = (
+                response.get("ContentType")
+                or "application/octet-stream"
+            )
+            body = response["Body"]
+
+            return StreamingResponse(
+                body.iter_chunks(chunk_size=1024 * 1024),
+                media_type=content_type,
+                headers={
+                    "Cache-Control": "private, max-age=3600"
+                }
+            )
+        except Exception as exc:
+            error_code = ""
+            try:
+                error_code = exc.response.get("Error", {}).get("Code", "")
+            except Exception:
+                pass
+
+            if error_code in ("NoSuchKey", "404", "NotFound"):
+                raise HTTPException(
+                    status_code=404,
+                    detail="proof_not_found"
+                )
+
+            print(
+                "R2_READ_ERROR:",
+                type(exc).__name__,
+                str(exc)[:500],
+                flush=True
+            )
+            raise HTTPException(
+                status_code=502,
+                detail="proof_storage_error"
+            )
+
+    # Local fallback for development only.
     path = os.path.join(UPLOAD_DIR, safe_name)
 
     if not os.path.isfile(path):
