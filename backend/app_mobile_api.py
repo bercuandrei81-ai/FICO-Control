@@ -434,7 +434,9 @@ async def protect_admin_routes(request: Request, call_next):
         "/admin/forgot-password/",
         "/admin/forgot-password/send-code",
         "/admin/reset-password",
-        "/admin/reset-password/"
+        "/admin/reset-password/",
+        "/admin/setup-name",
+        "/admin/setup-name/"
     }
 
     if path in public_admin_paths:
