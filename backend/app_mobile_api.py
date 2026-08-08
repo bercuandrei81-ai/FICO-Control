@@ -427,7 +427,17 @@ button{{border:0;background:#17212b;color:#fff;font-weight:800;cursor:pointer}}
 async def protect_admin_routes(request: Request, call_next):
     path = request.url.path
 
-    if path in ("/admin/login", "/admin/login/"):
+    public_admin_paths = {
+        "/admin/login",
+        "/admin/login/",
+        "/admin/forgot-password",
+        "/admin/forgot-password/",
+        "/admin/forgot-password/send-code",
+        "/admin/reset-password",
+        "/admin/reset-password/"
+    }
+
+    if path in public_admin_paths:
         return await call_next(request)
 
     protected = path.startswith("/admin") or path.startswith("/proof/")
@@ -457,18 +467,13 @@ def admin_login_page(request: Request, next: str | None = None, error: str | Non
     if current:
         return RedirectResponse(next or "/admin", status_code=303)
 
-    configured = False
     conn = db()
     configured = bool(get_shared_password_hash(conn))
     conn.close()
 
     error_text = ""
     if error == "invalid":
-        error_text = "Numele sau parola nu sunt corecte."
-    elif error == "blocked":
-        error_text = "Accesul pentru acest nume este blocat."
-    elif error == "name":
-        error_text = "Introdu numele tău."
+        error_text = "Parola nu este corectă."
     elif not configured:
         error_text = "Parola Admin nu este încă configurată în Render."
 
@@ -498,6 +503,8 @@ button{{margin-top:22px;border:0;background:#17212b;color:#fff;font-weight:800;c
 .langs{{display:flex;gap:6px;justify-content:flex-end}}
 .langs button{{width:auto;margin:0;padding:7px 9px;background:#f2f4f7;color:#667085}}
 .langs button.active{{background:#17212b;color:#fff}}
+.forgot{{display:block;text-align:right;margin-top:11px;color:#475467;text-decoration:none;font-weight:700;font-size:14px}}
+.forgot:hover{{text-decoration:underline}}
 </style>
 </head>
 <body>
@@ -510,23 +517,22 @@ button{{margin-top:22px;border:0;background:#17212b;color:#fff;font-weight:800;c
 </div>
 <div class="brand">FICO CONTROL</div>
 <h1 id="title">Admin Login</h1>
-<p class="subtitle" id="subtitle">Introdu numele tău și parola comună pentru a intra în Admin Dashboard.</p>
+<p class="subtitle" id="subtitle">Introdu parola comună pentru a intra în Admin Dashboard.</p>
 {error_html}
 <form method="post" action="/admin/login">
 <input type="hidden" name="next_path" value="{next_value}">
-<label id="nameLabel">Numele tău</label>
-<input name="display_name" placeholder="ex. Marius" autocomplete="name" required>
 <label id="passwordLabel">Parola</label>
 <input name="password" type="password" autocomplete="current-password" required>
+<a class="forgot" id="forgotLink" href="/admin/forgot-password">Ai uitat parola?</a>
 <button type="submit" id="loginButton">Intră în Admin</button>
 </form>
 </div>
 </div>
 <script>
 const T = {{
- ro: {{title:"Admin Login",subtitle:"Introdu numele tău și parola comună pentru a intra în Admin Dashboard.",name:"Numele tău",password:"Parola",button:"Intră în Admin"}},
- de: {{title:"Admin Login",subtitle:"Gib deinen Namen und das gemeinsame Passwort ein, um das Admin Dashboard zu öffnen.",name:"Dein Name",password:"Passwort",button:"Admin öffnen"}},
- en: {{title:"Admin Login",subtitle:"Enter your name and the shared password to open the Admin Dashboard.",name:"Your name",password:"Password",button:"Open Admin"}}
+ ro: {{title:"Admin Login",subtitle:"Introdu parola comună pentru a intra în Admin Dashboard.",password:"Parola",forgot:"Ai uitat parola?",button:"Intră în Admin"}},
+ de: {{title:"Admin Login",subtitle:"Gib das gemeinsame Passwort ein, um das Admin Dashboard zu öffnen.",password:"Passwort",forgot:"Passwort vergessen?",button:"Admin öffnen"}},
+ en: {{title:"Admin Login",subtitle:"Enter the shared password to open the Admin Dashboard.",password:"Password",forgot:"Forgot password?",button:"Open Admin"}}
 }};
 document.querySelectorAll("[data-lang]").forEach(btn => {{
  btn.addEventListener("click", () => {{
@@ -535,8 +541,8 @@ document.querySelectorAll("[data-lang]").forEach(btn => {{
    const t=T[btn.dataset.lang];
    document.getElementById("title").textContent=t.title;
    document.getElementById("subtitle").textContent=t.subtitle;
-   document.getElementById("nameLabel").textContent=t.name;
    document.getElementById("passwordLabel").textContent=t.password;
+   document.getElementById("forgotLink").textContent=t.forgot;
    document.getElementById("loginButton").textContent=t.button;
  }});
 }});
@@ -549,16 +555,188 @@ document.querySelectorAll("[data-lang]").forEach(btn => {{
 
 @app.post("/admin/login")
 def admin_login(
-    display_name: str = Form(...),
+    request: Request,
     password: str = Form(...),
     next_path: str = Form("/admin")
 ):
+    conn = db()
+    password_hash = get_shared_password_hash(conn)
+
+    if not password_hash or not verify_password(password, password_hash):
+        conn.close()
+        return RedirectResponse("/admin/login?error=invalid", status_code=303)
+
+    # Reuse the remembered browser name if available.
+    remembered_name = request.cookies.get("fico_admin_display_name")
+    clean_name = " ".join((remembered_name or "").strip().split())
+
+    if clean_name:
+        normalized = normalize_admin_name(clean_name)
+        blocked = conn.execute(
+            "SELECT 1 FROM blocked_admin_names WHERE normalized_name=?",
+            (normalized,)
+        ).fetchone()
+
+        if blocked:
+            clean_name = ""
+
+    if clean_name:
+        token = create_admin_session(conn, clean_name)
+        conn.close()
+
+        safe_next = next_path if next_path.startswith("/admin") else "/admin"
+        response = RedirectResponse(safe_next, status_code=303)
+        response.set_cookie(
+            ADMIN_COOKIE_NAME,
+            token,
+            max_age=ADMIN_SESSION_DAYS * 24 * 60 * 60,
+            httponly=True,
+            secure=True,
+            samesite="lax"
+        )
+        return response
+
+    # Password is correct, but this browser has no remembered name yet.
+    temp_token = secrets.token_urlsafe(24)
+    now = utc_now()
+    expires = now + timedelta(minutes=10)
+
+    conn.execute(
+        """
+        INSERT INTO admin_sessions(
+            session_token, display_name, normalized_name,
+            created_at, last_seen, expires_at, revoked
+        ) VALUES(?,?,?,?,?,?,0)
+        """,
+        (
+            temp_token,
+            "__PENDING_NAME__",
+            "__pending_name__",
+            iso_utc(now),
+            iso_utc(now),
+            iso_utc(expires)
+        )
+    )
+    conn.commit()
+    conn.close()
+
+    response = RedirectResponse(
+        "/admin/setup-name?next=" + urllib.parse.quote(next_path, safe=""),
+        status_code=303
+    )
+    response.set_cookie(
+        "fico_admin_pending",
+        temp_token,
+        max_age=600,
+        httponly=True,
+        secure=True,
+        samesite="lax"
+    )
+    return response
+
+
+@app.get("/admin/setup-name", response_class=HTMLResponse)
+def admin_setup_name_page(request: Request, next: str | None = None, error: str | None = None):
+    pending = request.cookies.get("fico_admin_pending")
+    if not pending:
+        return RedirectResponse("/admin/login", status_code=303)
+
+    conn = db()
+    row = conn.execute(
+        """
+        SELECT session_token, expires_at, revoked
+        FROM admin_sessions
+        WHERE session_token=? AND display_name='__PENDING_NAME__'
+        """,
+        (pending,)
+    ).fetchone()
+    conn.close()
+
+    expires = parse_iso_utc(row["expires_at"]) if row else None
+    if not row or row["revoked"] or not expires or expires <= utc_now():
+        return RedirectResponse("/admin/login", status_code=303)
+
+    error_html = ""
+    if error == "blocked":
+        error_html = '<div class="error">Acest nume este blocat.</div>'
+    elif error == "name":
+        error_html = '<div class="error">Introdu numele tău.</div>'
+
+    next_value = html.escape(next or "/admin", quote=True)
+
+    return HTMLResponse(f"""
+<!doctype html>
+<html lang="ro">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>FICO Control - Nume</title>
+<style>
+*{{box-sizing:border-box}}
+body{{margin:0;background:#f4f6f8;font-family:Arial,sans-serif;color:#17212b}}
+.wrap{{width:min(92%,470px);margin:65px auto}}
+.card{{background:#fff;border-radius:22px;padding:30px;box-shadow:0 12px 35px rgba(0,0,0,.08)}}
+.brand{{font-size:13px;font-weight:900;letter-spacing:2px}}
+h1{{font-size:30px;margin:22px 0 8px}}
+p{{color:#667085;line-height:1.5}}
+label{{display:block;font-weight:800;margin:18px 0 7px}}
+input,button{{width:100%;padding:14px;border-radius:11px;font-size:16px}}
+input{{border:1px solid #d8dde3}}
+button{{margin-top:22px;border:0;background:#17212b;color:#fff;font-weight:800;cursor:pointer}}
+.error{{margin:14px 0;padding:12px;border-radius:10px;background:#fdeeee;color:#b42318;font-weight:700}}
+</style>
+</head>
+<body>
+<div class="wrap"><div class="card">
+<div class="brand">FICO CONTROL</div>
+<h1>Cum te numești?</h1>
+<p>Acest pas apare o singură dată pe acest browser. Numele va fi folosit doar pentru a arăta în Owner cine este conectat.</p>
+{error_html}
+<form method="post" action="/admin/setup-name">
+<input type="hidden" name="next_path" value="{next_value}">
+<label>Numele tău</label>
+<input name="display_name" placeholder="Numele tău" autocomplete="name" required>
+<button type="submit">Continuă</button>
+</form>
+</div></div>
+</body>
+</html>
+""")
+
+
+@app.post("/admin/setup-name")
+def admin_setup_name(
+    request: Request,
+    display_name: str = Form(...),
+    next_path: str = Form("/admin")
+):
+    pending = request.cookies.get("fico_admin_pending")
+    if not pending:
+        return RedirectResponse("/admin/login", status_code=303)
+
     clean_name = " ".join((display_name or "").strip().split())
     if not clean_name:
-        return RedirectResponse("/admin/login?error=name", status_code=303)
+        return RedirectResponse(
+            "/admin/setup-name?error=name",
+            status_code=303
+        )
 
     normalized = normalize_admin_name(clean_name)
     conn = db()
+
+    row = conn.execute(
+        """
+        SELECT session_token, expires_at, revoked
+        FROM admin_sessions
+        WHERE session_token=? AND display_name='__PENDING_NAME__'
+        """,
+        (pending,)
+    ).fetchone()
+
+    expires = parse_iso_utc(row["expires_at"]) if row else None
+    if not row or row["revoked"] or not expires or expires <= utc_now():
+        conn.close()
+        return RedirectResponse("/admin/login", status_code=303)
 
     blocked = conn.execute(
         "SELECT 1 FROM blocked_admin_names WHERE normalized_name=?",
@@ -567,14 +745,36 @@ def admin_login(
 
     if blocked:
         conn.close()
-        return RedirectResponse("/admin/login?error=blocked", status_code=303)
+        return RedirectResponse(
+            "/admin/setup-name?error=blocked",
+            status_code=303
+        )
 
-    password_hash = get_shared_password_hash(conn)
-    if not password_hash or not verify_password(password, password_hash):
-        conn.close()
-        return RedirectResponse("/admin/login?error=invalid", status_code=303)
+    token = secrets.token_urlsafe(36)
+    now = utc_now()
+    session_expires = now + timedelta(days=ADMIN_SESSION_DAYS)
 
-    token = create_admin_session(conn, clean_name)
+    conn.execute(
+        "UPDATE admin_sessions SET revoked=1 WHERE session_token=?",
+        (pending,)
+    )
+    conn.execute(
+        """
+        INSERT INTO admin_sessions(
+            session_token, display_name, normalized_name,
+            created_at, last_seen, expires_at, revoked
+        ) VALUES(?,?,?,?,?,?,0)
+        """,
+        (
+            token,
+            clean_name,
+            normalized,
+            iso_utc(now),
+            iso_utc(now),
+            iso_utc(session_expires)
+        )
+    )
+    conn.commit()
     conn.close()
 
     safe_next = next_path if next_path.startswith("/admin") else "/admin"
@@ -587,6 +787,15 @@ def admin_login(
         secure=True,
         samesite="lax"
     )
+    response.set_cookie(
+        "fico_admin_display_name",
+        clean_name,
+        max_age=365 * 24 * 60 * 60,
+        httponly=True,
+        secure=True,
+        samesite="lax"
+    )
+    response.delete_cookie("fico_admin_pending")
     return response
 
 
@@ -605,6 +814,160 @@ def admin_logout(request: Request):
     response = RedirectResponse("/admin/login", status_code=303)
     response.delete_cookie(ADMIN_COOKIE_NAME)
     return response
+
+
+@app.get("/admin/forgot-password", response_class=HTMLResponse)
+def forgot_password_page(message: str | None = None, error: str | None = None):
+    message_html = ""
+    if message:
+        message_html = f'<div class="ok">{html.escape(message)}</div>'
+    if error:
+        message_html = f'<div class="error">{html.escape(error)}</div>'
+
+    return HTMLResponse(f"""
+<!doctype html>
+<html lang="ro">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>FICO Control - Ai uitat parola?</title>
+<style>
+*{{box-sizing:border-box}}
+body{{margin:0;background:#f4f6f8;font-family:Arial,sans-serif;color:#17212b}}
+.wrap{{width:min(92%,500px);margin:65px auto}}
+.card{{background:#fff;border-radius:22px;padding:30px;box-shadow:0 12px 35px rgba(0,0,0,.08)}}
+.brand{{font-size:13px;font-weight:900;letter-spacing:2px}}
+h1{{font-size:30px;margin:22px 0 8px}}
+p{{color:#667085;line-height:1.5}}
+input,button{{width:100%;padding:14px;border-radius:11px;font-size:16px}}
+input{{border:1px solid #d8dde3;margin-top:10px}}
+button{{margin-top:16px;border:0;background:#17212b;color:#fff;font-weight:800;cursor:pointer}}
+.ok,.error{{margin:14px 0;padding:12px;border-radius:10px;font-weight:700}}
+.ok{{background:#e9f8ef;color:#14804a}}
+.error{{background:#fdeeee;color:#b42318}}
+.back{{display:block;text-align:center;margin-top:16px;color:#17212b;font-weight:700;text-decoration:none}}
+</style>
+</head>
+<body>
+<div class="wrap"><div class="card">
+<div class="brand">FICO CONTROL</div>
+<h1>Ai uitat parola?</h1>
+<p>Parola poate fi resetată numai cu un cod trimis la emailul Owner: <strong>{html.escape(mask_email(OWNER_EMAIL))}</strong>.</p>
+{message_html}
+<form method="post" action="/admin/forgot-password/send-code">
+<button type="submit">Trimite codul pe email</button>
+</form>
+<form method="post" action="/admin/reset-password">
+<input name="code" inputmode="numeric" maxlength="6" placeholder="Cod din 6 cifre" required>
+<input name="new_password" type="password" minlength="8" placeholder="Parola nouă (minimum 8 caractere)" required>
+<button type="submit">Setează parola nouă</button>
+</form>
+<a class="back" href="/admin/login">Înapoi la login</a>
+</div></div>
+</body>
+</html>
+""")
+
+
+@app.post("/admin/forgot-password/send-code")
+def forgot_password_send_code():
+    if not OWNER_EMAIL or not RESEND_API_KEY:
+        return forgot_password_page(
+            error="Emailul Owner sau cheia de email nu este configurată."
+        )
+
+    code = f"{secrets.randbelow(1000000):06d}"
+    now = utc_now()
+    expires = now + timedelta(minutes=OWNER_CODE_MINUTES)
+
+    conn = db()
+    conn.execute("UPDATE owner_email_codes SET used=1 WHERE used=0")
+    conn.execute(
+        """
+        INSERT INTO owner_email_codes(code_hash, created_at, expires_at, used)
+        VALUES(?,?,?,0)
+        """,
+        (hash_owner_code(code), iso_utc(now), iso_utc(expires))
+    )
+    conn.commit()
+    conn.close()
+
+    try:
+        send_owner_verification_code(code)
+    except Exception:
+        return forgot_password_page(
+            error="Codul nu a putut fi trimis. Verifică setările de email."
+        )
+
+    return forgot_password_page(
+        message=f"Codul a fost trimis la {mask_email(OWNER_EMAIL)}."
+    )
+
+
+@app.post("/admin/reset-password")
+def reset_password_with_email_code(
+    code: str = Form(...),
+    new_password: str = Form(...)
+):
+    clean_code = re.sub(r"\D", "", code or "")
+    if len(clean_code) != 6:
+        return forgot_password_page(error="Cod invalid.")
+
+    if len(new_password) < 8:
+        return forgot_password_page(
+            error="Parola trebuie să aibă minimum 8 caractere."
+        )
+
+    conn = db()
+    row = conn.execute(
+        """
+        SELECT id, code_hash, expires_at
+        FROM owner_email_codes
+        WHERE used=0
+        ORDER BY id DESC
+        LIMIT 1
+        """
+    ).fetchone()
+
+    if not row:
+        conn.close()
+        return forgot_password_page(error="Nu există un cod activ.")
+
+    expires = parse_iso_utc(row["expires_at"])
+    valid = (
+        expires
+        and expires > utc_now()
+        and hmac.compare_digest(
+            row["code_hash"],
+            hash_owner_code(clean_code)
+        )
+    )
+
+    if not valid:
+        conn.close()
+        return forgot_password_page(
+            error="Codul este greșit sau a expirat."
+        )
+
+    conn.execute(
+        "UPDATE owner_email_codes SET used=1 WHERE id=?",
+        (row["id"],)
+    )
+    conn.execute(
+        """
+        INSERT INTO admin_settings(setting_key, setting_value)
+        VALUES('shared_password_hash', ?)
+        ON CONFLICT(setting_key) DO UPDATE SET
+            setting_value=excluded.setting_value
+        """,
+        (hash_password(new_password),)
+    )
+    # Force everyone to use the new password.
+    conn.execute("UPDATE admin_sessions SET revoked=1")
+    conn.commit()
+    conn.close()
+
+    return RedirectResponse("/admin/login", status_code=303)
 
 
 @app.post("/admin/owner/send-code")
