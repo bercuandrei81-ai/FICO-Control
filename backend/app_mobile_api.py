@@ -498,6 +498,10 @@ h1{{font-size:31px;margin:22px 0 8px}}
 label{{display:block;font-weight:800;margin:16px 0 7px}}
 input,button{{width:100%;padding:14px;border-radius:11px;font-size:16px}}
 input{{border:1px solid #d8dde3}}
+.password-wrap{{position:relative}}
+.password-wrap input{{padding-right:54px}}
+.eye-btn{{position:absolute;right:8px;top:50%;transform:translateY(-50%);width:42px;height:42px;margin:0;padding:0;border:0;background:transparent;color:#667085;font-size:20px;cursor:pointer;display:flex;align-items:center;justify-content:center}}
+.eye-btn:hover{{background:#f2f4f7}}
 button{{margin-top:22px;border:0;background:#17212b;color:#fff;font-weight:800;cursor:pointer}}
 .error{{margin:14px 0;padding:12px;border-radius:10px;background:#fdeeee;color:#b42318;font-weight:700}}
 .langs{{display:flex;gap:6px;justify-content:flex-end}}
@@ -522,7 +526,10 @@ button{{margin-top:22px;border:0;background:#17212b;color:#fff;font-weight:800;c
 <form method="post" action="/admin/login">
 <input type="hidden" name="next_path" value="{next_value}">
 <label id="passwordLabel">Parola</label>
-<input name="password" type="password" autocomplete="current-password" required>
+<div class="password-wrap">
+<input id="adminPassword" name="password" type="password" autocomplete="current-password" required>
+<button class="eye-btn" id="togglePassword" type="button" aria-label="Arată parola" title="Arată parola">◉</button>
+</div>
 <a class="forgot" id="forgotLink" href="/admin/forgot-password">Ai uitat parola?</a>
 <button type="submit" id="loginButton">Intră în Admin</button>
 </form>
@@ -546,6 +553,21 @@ document.querySelectorAll("[data-lang]").forEach(btn => {{
    document.getElementById("loginButton").textContent=t.button;
  }});
 }});
+const passwordInput = document.getElementById("adminPassword");
+const togglePassword = document.getElementById("togglePassword");
+togglePassword.addEventListener("click", () => {{
+  const showing = passwordInput.type === "text";
+  passwordInput.type = showing ? "password" : "text";
+  togglePassword.textContent = showing ? "◉" : "◎";
+  togglePassword.setAttribute(
+    "aria-label",
+    showing ? "Arată parola" : "Ascunde parola"
+  );
+  togglePassword.setAttribute(
+    "title",
+    showing ? "Arată parola" : "Ascunde parola"
+  );
+}});
 </script>
 </body>
 </html>
@@ -562,9 +584,27 @@ def admin_login(
     conn = db()
     password_hash = get_shared_password_hash(conn)
 
-    if not password_hash or not verify_password(password, password_hash):
+    db_password_ok = bool(
+        password_hash and verify_password(password, password_hash)
+    )
+
+    env_password_ok = bool(
+        ADMIN_INITIAL_PASSWORD
+        and hmac.compare_digest(password, ADMIN_INITIAL_PASSWORD)
+    )
+
+    if not db_password_ok and not env_password_ok:
         conn.close()
         return RedirectResponse("/admin/login?error=invalid", status_code=303)
+
+    if env_password_ok and not db_password_ok:
+        conn.execute("""
+            INSERT INTO admin_settings(setting_key, setting_value)
+            VALUES('shared_password_hash', ?)
+            ON CONFLICT(setting_key) DO UPDATE SET
+                setting_value=excluded.setting_value
+        """, (hash_password(ADMIN_INITIAL_PASSWORD),))
+        conn.commit()
 
     # Reuse the remembered browser name if available.
     remembered_name = request.cookies.get("fico_admin_display_name")
