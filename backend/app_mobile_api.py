@@ -19,8 +19,12 @@ import base64
 import secrets
 import hmac
 import hashlib
+import threading
 
 DB = "fico.db"
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+DB_BACKEND = "postgresql" if DATABASE_URL else "sqlite"
+
 UPLOAD_DIR = "uploads"
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
 ALLOWED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/webp"}
@@ -43,13 +47,100 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 app = FastAPI(title="FICO Control")
 
 
+def _pg_translate_sql(sql: str) -> str:
+    """
+    Translate the small amount of SQLite-flavoured SQL used by the existing
+    FICO Control code into PostgreSQL-compatible SQL.
+    """
+    translated = sql
+
+    if re.search(r"\bINSERT\s+OR\s+IGNORE\s+INTO\b", translated, re.IGNORECASE):
+        translated = re.sub(
+            r"\bINSERT\s+OR\s+IGNORE\s+INTO\b",
+            "INSERT INTO",
+            translated,
+            flags=re.IGNORECASE
+        )
+        if "ON CONFLICT" not in translated.upper():
+            translated = translated.rstrip().rstrip(";") + " ON CONFLICT DO NOTHING"
+
+    # Existing code uses SQLite '?' placeholders. Psycopg uses '%s'.
+    translated = translated.replace("?", "%s")
+    return translated
+
+
+class PostgresCompatConnection:
+    """
+    Thin compatibility wrapper so the existing application code can keep using:
+        conn.execute(...).fetchone()
+        conn.execute(...).fetchall()
+        conn.commit()
+        conn.close()
+
+    Rows are returned as dictionaries, matching the application's existing
+    row["column"] access pattern.
+    """
+
+    def __init__(self):
+        import psycopg
+        from psycopg.rows import dict_row
+
+        self._conn = psycopg.connect(
+            DATABASE_URL,
+            row_factory=dict_row,
+            connect_timeout=10
+        )
+
+    def execute(self, sql, params=()):
+        return self._conn.execute(_pg_translate_sql(sql), params or ())
+
+    def executescript(self, script: str):
+        # Schema scripts used here contain simple semicolon-delimited statements.
+        for statement in script.split(";"):
+            statement = statement.strip()
+            if statement:
+                self.execute(statement)
+
+    def commit(self):
+        self._conn.commit()
+
+    def rollback(self):
+        self._conn.rollback()
+
+    def close(self):
+        self._conn.close()
+
+
 def db():
+    if DB_BACKEND == "postgresql":
+        return PostgresCompatConnection()
+
     conn = sqlite3.connect(DB)
     conn.row_factory = sqlite3.Row
     return conn
 
 
 def ensure_column(conn, table, column, definition):
+    if DB_BACKEND == "postgresql":
+        row = conn.execute(
+            """
+            SELECT 1
+            FROM information_schema.columns
+            WHERE table_schema='public'
+              AND table_name=?
+              AND column_name=?
+            """,
+            (table, column)
+        ).fetchone()
+
+        if not row:
+            safe_table = re.sub(r"[^a-zA-Z0-9_]", "", table)
+            safe_column = re.sub(r"[^a-zA-Z0-9_]", "", column)
+            conn.execute(
+                f"ALTER TABLE {safe_table} ADD COLUMN {safe_column} {definition}"
+            )
+        return
+
     columns = {
         row["name"]
         for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
@@ -60,83 +151,173 @@ def ensure_column(conn, table, column, definition):
 
 def init_db():
     conn = db()
-    conn.executescript("""
-    CREATE TABLE IF NOT EXISTS drivers(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT UNIQUE NOT NULL,
-        active INTEGER DEFAULT 1
-    );
 
-    CREATE TABLE IF NOT EXISTS daily_required(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        work_date TEXT NOT NULL,
-        driver_id INTEGER NOT NULL,
-        UNIQUE(work_date, driver_id),
-        FOREIGN KEY(driver_id) REFERENCES drivers(id)
-    );
+    if DB_BACKEND == "postgresql":
+        conn.executescript("""
+        CREATE TABLE IF NOT EXISTS drivers(
+            id BIGSERIAL PRIMARY KEY,
+            name TEXT UNIQUE NOT NULL,
+            active INTEGER DEFAULT 1
+        );
 
-    CREATE TABLE IF NOT EXISTS submissions(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        work_date TEXT NOT NULL,
-        driver_id INTEGER NOT NULL,
-        fico_score INTEGER NOT NULL,
-        submitted_at TEXT NOT NULL,
-        UNIQUE(work_date, driver_id),
-        FOREIGN KEY(driver_id) REFERENCES drivers(id)
-    );
+        CREATE TABLE IF NOT EXISTS daily_required(
+            id BIGSERIAL PRIMARY KEY,
+            work_date TEXT NOT NULL,
+            driver_id BIGINT NOT NULL,
+            UNIQUE(work_date, driver_id),
+            FOREIGN KEY(driver_id) REFERENCES drivers(id)
+        );
 
-    CREATE TABLE IF NOT EXISTS unresolved_submissions(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        work_date TEXT NOT NULL,
-        entered_full_name TEXT NOT NULL,
-        fico_score INTEGER NOT NULL,
-        submitted_at TEXT NOT NULL,
-        proof_filename TEXT,
-        proof_original_name TEXT,
-        detected_fico_score INTEGER,
-        verification_status TEXT,
-        best_match_name TEXT,
-        best_match_score REAL,
-        match_reason TEXT
-    );
+        CREATE TABLE IF NOT EXISTS submissions(
+            id BIGSERIAL PRIMARY KEY,
+            work_date TEXT NOT NULL,
+            driver_id BIGINT NOT NULL,
+            fico_score INTEGER NOT NULL,
+            submitted_at TEXT NOT NULL,
+            UNIQUE(work_date, driver_id),
+            FOREIGN KEY(driver_id) REFERENCES drivers(id)
+        );
 
-    CREATE TABLE IF NOT EXISTS admin_settings(
-        setting_key TEXT PRIMARY KEY,
-        setting_value TEXT NOT NULL
-    );
+        CREATE TABLE IF NOT EXISTS unresolved_submissions(
+            id BIGSERIAL PRIMARY KEY,
+            work_date TEXT NOT NULL,
+            entered_full_name TEXT NOT NULL,
+            fico_score INTEGER NOT NULL,
+            submitted_at TEXT NOT NULL,
+            proof_filename TEXT,
+            proof_original_name TEXT,
+            detected_fico_score INTEGER,
+            verification_status TEXT,
+            best_match_name TEXT,
+            best_match_score DOUBLE PRECISION,
+            match_reason TEXT
+        );
 
-    CREATE TABLE IF NOT EXISTS admin_sessions(
-        session_token TEXT PRIMARY KEY,
-        display_name TEXT NOT NULL,
-        normalized_name TEXT NOT NULL,
-        created_at TEXT NOT NULL,
-        last_seen TEXT NOT NULL,
-        expires_at TEXT NOT NULL,
-        revoked INTEGER DEFAULT 0,
-        owner_verified_until TEXT
-    );
+        CREATE TABLE IF NOT EXISTS admin_settings(
+            setting_key TEXT PRIMARY KEY,
+            setting_value TEXT NOT NULL
+        );
 
-    CREATE TABLE IF NOT EXISTS blocked_admin_names(
-        normalized_name TEXT PRIMARY KEY,
-        display_name TEXT NOT NULL,
-        blocked_at TEXT NOT NULL
-    );
+        CREATE TABLE IF NOT EXISTS admin_sessions(
+            session_token TEXT PRIMARY KEY,
+            display_name TEXT NOT NULL,
+            normalized_name TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            last_seen TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            revoked INTEGER DEFAULT 0,
+            owner_verified_until TEXT
+        );
 
-    CREATE TABLE IF NOT EXISTS owner_email_codes(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        code_hash TEXT NOT NULL,
-        created_at TEXT NOT NULL,
-        expires_at TEXT NOT NULL,
-        used INTEGER DEFAULT 0
-    );
-    """)
+        CREATE TABLE IF NOT EXISTS blocked_admin_names(
+            normalized_name TEXT PRIMARY KEY,
+            display_name TEXT NOT NULL,
+            blocked_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS owner_email_codes(
+            id BIGSERIAL PRIMARY KEY,
+            code_hash TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            used INTEGER DEFAULT 0
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_daily_required_work_date
+            ON daily_required(work_date);
+
+        CREATE INDEX IF NOT EXISTS idx_submissions_work_date
+            ON submissions(work_date);
+
+        CREATE INDEX IF NOT EXISTS idx_unresolved_work_date
+            ON unresolved_submissions(work_date);
+
+        CREATE INDEX IF NOT EXISTS idx_admin_sessions_expires
+            ON admin_sessions(expires_at);
+        """)
+    else:
+        conn.executescript("""
+        CREATE TABLE IF NOT EXISTS drivers(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT UNIQUE NOT NULL,
+            active INTEGER DEFAULT 1
+        );
+
+        CREATE TABLE IF NOT EXISTS daily_required(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            work_date TEXT NOT NULL,
+            driver_id INTEGER NOT NULL,
+            UNIQUE(work_date, driver_id),
+            FOREIGN KEY(driver_id) REFERENCES drivers(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS submissions(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            work_date TEXT NOT NULL,
+            driver_id INTEGER NOT NULL,
+            fico_score INTEGER NOT NULL,
+            submitted_at TEXT NOT NULL,
+            UNIQUE(work_date, driver_id),
+            FOREIGN KEY(driver_id) REFERENCES drivers(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS unresolved_submissions(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            work_date TEXT NOT NULL,
+            entered_full_name TEXT NOT NULL,
+            fico_score INTEGER NOT NULL,
+            submitted_at TEXT NOT NULL,
+            proof_filename TEXT,
+            proof_original_name TEXT,
+            detected_fico_score INTEGER,
+            verification_status TEXT,
+            best_match_name TEXT,
+            best_match_score REAL,
+            match_reason TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS admin_settings(
+            setting_key TEXT PRIMARY KEY,
+            setting_value TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS admin_sessions(
+            session_token TEXT PRIMARY KEY,
+            display_name TEXT NOT NULL,
+            normalized_name TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            last_seen TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            revoked INTEGER DEFAULT 0,
+            owner_verified_until TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS blocked_admin_names(
+            normalized_name TEXT PRIMARY KEY,
+            display_name TEXT NOT NULL,
+            blocked_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS owner_email_codes(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            code_hash TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            used INTEGER DEFAULT 0
+        );
+        """)
 
     ensure_column(conn, "submissions", "entered_full_name", "TEXT")
     ensure_column(conn, "submissions", "proof_filename", "TEXT")
     ensure_column(conn, "submissions", "proof_original_name", "TEXT")
     ensure_column(conn, "submissions", "detected_fico_score", "INTEGER")
     ensure_column(conn, "submissions", "verification_status", "TEXT")
-    ensure_column(conn, "submissions", "name_match_score", "REAL")
+    ensure_column(
+        conn,
+        "submissions",
+        "name_match_score",
+        "DOUBLE PRECISION" if DB_BACKEND == "postgresql" else "REAL"
+    )
 
     existing_password = conn.execute(
         "SELECT setting_value FROM admin_settings WHERE setting_key='shared_password_hash'"
@@ -150,7 +331,12 @@ def init_db():
             salt,
             250000
         )
-        encoded = "pbkdf2_sha256$250000$" + base64.b64encode(salt).decode("ascii") + "$" + base64.b64encode(digest).decode("ascii")
+        encoded = (
+            "pbkdf2_sha256$250000$"
+            + base64.b64encode(salt).decode("ascii")
+            + "$"
+            + base64.b64encode(digest).decode("ascii")
+        )
         conn.execute(
             "INSERT INTO admin_settings(setting_key, setting_value) VALUES(?,?)",
             ("shared_password_hash", encoded)
@@ -160,7 +346,32 @@ def init_db():
     conn.close()
 
 
+def db_healthcheck():
+    conn = db()
+    try:
+        row = conn.execute("SELECT 1 AS ok").fetchone()
+        return bool(row and row["ok"] == 1)
+    finally:
+        conn.close()
+
+
 init_db()
+
+
+@app.get("/health/db")
+def health_db():
+    try:
+        ok = db_healthcheck()
+        return {
+            "ok": bool(ok),
+            "database": DB_BACKEND
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "database": DB_BACKEND,
+            "error": type(exc).__name__
+        }
 
 
 def utc_now():
@@ -2505,6 +2716,7 @@ th{{font-size:13px;color:#667085;text-transform:uppercase;letter-spacing:.4px}}
         <h1>Admin Dashboard</h1>
         <div style="margin-top:8px;color:#667085;font-size:13px">
             Conectat ca: <strong>{html.escape(getattr(request.state, "admin_session", {}).get("display_name", "Admin"))}</strong>
+            · Bază date: <strong>{html.escape(DB_BACKEND.upper())}</strong>
         </div>
     </div>
 
