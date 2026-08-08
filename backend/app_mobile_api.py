@@ -407,6 +407,7 @@ def init_db():
     ensure_column(conn, "submissions", "proof_original_name", "TEXT")
     ensure_column(conn, "submissions", "detected_fico_score", "INTEGER")
     ensure_column(conn, "submissions", "verification_status", "TEXT")
+    ensure_column(conn, "mentor_connected", "first_connection_time", "TEXT")
     ensure_column(
         conn,
         "submissions",
@@ -2204,8 +2205,44 @@ def mentor_name_key(value: str) -> str:
     return " ".join(sorted(tokens))
 
 
-def extract_mentor_names_from_xlsx(raw: bytes) -> list[str]:
-    """Read Mentor Shift Report and return unique connected drivers."""
+def parse_mentor_time(value):
+    """Return comparable minutes since midnight + HH:MM display text."""
+    if value is None:
+        return None, None
+
+    if isinstance(value, datetime):
+        return value.hour * 60 + value.minute, f"{value.hour:02d}:{value.minute:02d}"
+
+    if isinstance(value, time):
+        return value.hour * 60 + value.minute, f"{value.hour:02d}:{value.minute:02d}"
+
+    raw = str(value).strip()
+    if not raw:
+        return None, None
+
+    formats = [
+        "%I:%M %p",
+        "%I:%M:%S %p",
+        "%H:%M",
+        "%H:%M:%S",
+    ]
+
+    for fmt in formats:
+        try:
+            parsed = datetime.strptime(raw.lower(), fmt)
+            minutes = parsed.hour * 60 + parsed.minute
+            return minutes, f"{parsed.hour:02d}:{parsed.minute:02d}"
+        except Exception:
+            pass
+
+    return None, raw
+
+
+def extract_mentor_names_from_xlsx(raw: bytes) -> list[dict]:
+    """
+    Read Mentor Shift Report and return one record per unique driver.
+    If a driver appears multiple times, keep the earliest Begin Route Time.
+    """
     workbook = openpyxl.load_workbook(
         io.BytesIO(raw),
         read_only=True,
@@ -2225,18 +2262,20 @@ def extract_mentor_names_from_xlsx(raw: bytes) -> list[str]:
 
     first_index = header_map.get("first name")
     last_index = header_map.get("last name")
+    begin_index = header_map.get("begin route time")
 
     if first_index is None or last_index is None:
         raise ValueError("mentor_name_columns_not_found")
 
-    names = []
-    seen = set()
+    records = {}
 
     for row in rows:
         first = ""
         last = ""
+
         if first_index < len(row) and row[first_index] is not None:
             first = str(row[first_index]).strip()
+
         if last_index < len(row) and row[last_index] is not None:
             last = str(row[last_index]).strip()
 
@@ -2245,11 +2284,40 @@ def extract_mentor_names_from_xlsx(raw: bytes) -> list[str]:
             continue
 
         key = mentor_name_key(name)
-        if key and key not in seen:
-            seen.add(key)
-            names.append(name)
+        if not key:
+            continue
 
-    return names
+        raw_begin = (
+            row[begin_index]
+            if begin_index is not None and begin_index < len(row)
+            else None
+        )
+        minutes, display_time = parse_mentor_time(raw_begin)
+
+        existing = records.get(key)
+
+        if existing is None:
+            records[key] = {
+                "name": name,
+                "first_connection_time": display_time,
+                "_minutes": minutes,
+            }
+            continue
+
+        old_minutes = existing.get("_minutes")
+
+        if minutes is not None and (
+            old_minutes is None or minutes < old_minutes
+        ):
+            existing["first_connection_time"] = display_time
+            existing["_minutes"] = minutes
+
+    result = []
+    for record in records.values():
+        record.pop("_minutes", None)
+        result.append(record)
+
+    return result
 
 
 def mentor_compare(required_name: str, connected_names: list[str]):
@@ -2352,7 +2420,7 @@ async def mentor_upload_shift(
 
     raw = await file.read()
     try:
-        names = extract_mentor_names_from_xlsx(raw)
+        mentor_records = extract_mentor_names_from_xlsx(raw)
     except Exception:
         return RedirectResponse(
             f"/admin/mentor?d={work_date}&error=mentor",
@@ -2363,21 +2431,38 @@ async def mentor_upload_shift(
     conn.execute("DELETE FROM mentor_connected WHERE work_date=?", (work_date,))
     imported_at = datetime.now(timezone.utc).isoformat()
 
-    for name in names:
+    for record in mentor_records:
+        name = record["name"]
+        first_connection_time = record.get("first_connection_time")
         key = mentor_name_key(name)
+
         if not key:
             continue
+
         conn.execute(
             """
             INSERT INTO mentor_connected(
-                work_date, driver_name, normalized_name, imported_at, source_filename
-            ) VALUES(?,?,?,?,?)
+                work_date,
+                driver_name,
+                normalized_name,
+                imported_at,
+                source_filename,
+                first_connection_time
+            ) VALUES(?,?,?,?,?,?)
             ON CONFLICT(work_date, normalized_name) DO UPDATE SET
                 driver_name=excluded.driver_name,
                 imported_at=excluded.imported_at,
-                source_filename=excluded.source_filename
+                source_filename=excluded.source_filename,
+                first_connection_time=excluded.first_connection_time
             """,
-            (work_date, name, key, imported_at, file.filename)
+            (
+                work_date,
+                name,
+                key,
+                imported_at,
+                file.filename,
+                first_connection_time
+            )
         )
 
     conn.commit()
@@ -2395,22 +2480,39 @@ def mentor_check_page(request: Request, d: str | None = None):
         (selected,)
     ).fetchall()
     mentor_rows = conn.execute(
-        "SELECT driver_name FROM mentor_connected WHERE work_date=? ORDER BY driver_name",
+        """
+        SELECT driver_name, first_connection_time
+        FROM mentor_connected
+        WHERE work_date=?
+        ORDER BY driver_name
+        """,
         (selected,)
     ).fetchall()
     conn.close()
 
     required_names = [row["driver_name"] for row in required_rows]
     mentor_names = [row["driver_name"] for row in mentor_rows]
+    mentor_time_by_key = {
+        mentor_name_key(row["driver_name"]): row["first_connection_time"]
+        for row in mentor_rows
+    }
 
     results = []
     for required_name in required_names:
         status, matched_name, confidence = mentor_compare(required_name, mentor_names)
+
+        first_connection_time = None
+        if matched_name and status != "missing":
+            first_connection_time = mentor_time_by_key.get(
+                mentor_name_key(matched_name)
+            )
+
         results.append({
             "name": required_name,
             "status": status,
             "matched_name": matched_name,
-            "confidence": confidence
+            "confidence": confidence,
+            "first_connection_time": first_connection_time
         })
 
     connected_count = sum(row["status"] == "connected" for row in results)
@@ -2432,16 +2534,23 @@ def mentor_check_page(request: Request, d: str | None = None):
             if row["confidence"] < 0.999:
                 mentor_match += f' <span class="confidence">{round(row["confidence"] * 100)}%</span>'
 
+        first_connection = (
+            html.escape(row["first_connection_time"])
+            if row.get("first_connection_time")
+            else "—"
+        )
+
         table_rows += f"""
         <tr>
           <td><strong>{html.escape(row['name'])}</strong></td>
           <td>{badge}</td>
+          <td><strong>{first_connection}</strong></td>
           <td>{mentor_match}</td>
         </tr>
         """
 
     if not results:
-        table_rows = '<tr><td class="empty" colspan="3">Încarcă lista Cortex pentru această zi.</td></tr>'
+        table_rows = '<tr><td class="empty" colspan="4">Încarcă lista Cortex pentru această zi.</td></tr>'
 
     missing_text = "\\n".join(row["name"] for row in missing).replace("`", "\\`")
 
@@ -2532,7 +2641,7 @@ th{{font-size:12px;color:#667085;background:#fafafa}}
 
     <div class="panel">
       <h2>2. Mentor Shift Report</h2>
-      <p>Lista celor care s-au conectat. Dacă același șofer apare de mai multe ori, este considerat o singură persoană conectată.</p>
+      <p>Lista celor care s-au conectat. Dacă același șofer apare de mai multe ori, este considerat o singură persoană, iar „Prima conectare” este cea mai devreme valoare din Begin Route Time.</p>
       <form class="upload-form" method="post" action="/admin/mentor/upload-shift" enctype="multipart/form-data">
         <input type="hidden" name="work_date" value="{selected}">
         <input type="file" name="file" accept=".xlsx" required>
@@ -2543,7 +2652,7 @@ th{{font-size:12px;color:#667085;background:#fafafa}}
 
   <section class="table-panel">
     <table>
-      <thead><tr><th>ȘOFER CORTEX</th><th>STATUS MENTOR</th><th>POTRIVIRE MENTOR</th></tr></thead>
+      <thead><tr><th>ȘOFER CORTEX</th><th>STATUS MENTOR</th><th>PRIMA CONECTARE</th><th>POTRIVIRE MENTOR</th></tr></thead>
       <tbody>{table_rows}</tbody>
     </table>
   </section>
