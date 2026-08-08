@@ -1,7 +1,7 @@
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse, FileResponse
 from pydantic import BaseModel
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone, time
 import sqlite3
 import io
 import csv
@@ -2470,6 +2470,113 @@ async def mentor_upload_shift(
     return RedirectResponse(f"/admin/mentor?d={work_date}", status_code=303)
 
 
+
+@app.post("/admin/mentor/upload-both")
+async def mentor_upload_both(
+    work_date: str = Form(...),
+    cortex_file: UploadFile = File(...),
+    mentor_file: UploadFile = File(...)
+):
+    if not (cortex_file.filename or "").lower().endswith(".xlsx"):
+        return RedirectResponse(
+            f"/admin/mentor?d={work_date}&error=cortex",
+            status_code=303
+        )
+
+    if not (mentor_file.filename or "").lower().endswith(".xlsx"):
+        return RedirectResponse(
+            f"/admin/mentor?d={work_date}&error=mentor",
+            status_code=303
+        )
+
+    cortex_raw = await cortex_file.read()
+    mentor_raw = await mentor_file.read()
+
+    try:
+        required_names = extract_driver_names_from_xlsx(cortex_raw)
+        mentor_records = extract_mentor_names_from_xlsx(mentor_raw)
+    except Exception:
+        return RedirectResponse(
+            f"/admin/mentor?d={work_date}&error=files",
+            status_code=303
+        )
+
+    conn = db()
+    imported_at = datetime.now(timezone.utc).isoformat()
+
+    # Replace both daily lists only after BOTH files were parsed successfully.
+    conn.execute("DELETE FROM mentor_required WHERE work_date=?", (work_date,))
+    conn.execute("DELETE FROM mentor_connected WHERE work_date=?", (work_date,))
+
+    for name in required_names:
+        key = mentor_name_key(name)
+        if not key:
+            continue
+
+        conn.execute(
+            """
+            INSERT INTO mentor_required(
+                work_date,
+                driver_name,
+                normalized_name,
+                imported_at,
+                source_filename
+            ) VALUES(?,?,?,?,?)
+            ON CONFLICT(work_date, normalized_name) DO UPDATE SET
+                driver_name=excluded.driver_name,
+                imported_at=excluded.imported_at,
+                source_filename=excluded.source_filename
+            """,
+            (
+                work_date,
+                name,
+                key,
+                imported_at,
+                cortex_file.filename
+            )
+        )
+
+    for record in mentor_records:
+        name = record["name"]
+        key = mentor_name_key(name)
+        if not key:
+            continue
+
+        conn.execute(
+            """
+            INSERT INTO mentor_connected(
+                work_date,
+                driver_name,
+                normalized_name,
+                imported_at,
+                source_filename,
+                first_connection_time
+            ) VALUES(?,?,?,?,?,?)
+            ON CONFLICT(work_date, normalized_name) DO UPDATE SET
+                driver_name=excluded.driver_name,
+                imported_at=excluded.imported_at,
+                source_filename=excluded.source_filename,
+                first_connection_time=excluded.first_connection_time
+            """,
+            (
+                work_date,
+                name,
+                key,
+                imported_at,
+                mentor_file.filename,
+                record.get("first_connection_time")
+            )
+        )
+
+    conn.commit()
+    conn.close()
+
+    return RedirectResponse(
+        f"/admin/mentor?d={work_date}&uploaded=1",
+        status_code=303
+    )
+
+
 @app.get("/admin/mentor", response_class=HTMLResponse)
 def mentor_check_page(request: Request, d: str | None = None):
     selected = d or date.today().isoformat()
@@ -2584,6 +2691,8 @@ input[type=date],input[type=file]{{border:1px solid #d8dde3;border-radius:10px;p
 .panel h2{{margin:0 0 7px;font-size:20px}}
 .panel p{{margin:0 0 16px;color:#667085;font-size:13px;line-height:1.5}}
 .upload-form{{display:flex;gap:10px;flex-wrap:wrap;align-items:center}}
+.single-upload-action{{display:flex;justify-content:center;margin:-2px 0 22px}}
+.single-upload-btn{{min-width:260px;padding:15px 28px;font-size:15px}}
 .table-panel{{background:#fff;border:1px solid #e4e7ec;border-radius:18px;overflow:hidden}}
 table{{width:100%;border-collapse:collapse}}
 th,td{{padding:14px 16px;text-align:left;border-bottom:1px solid #eef0f2}}
@@ -2628,27 +2737,31 @@ th{{font-size:12px;color:#667085;background:#fafafa}}
     <div class="stat"><strong>{review_count}</strong><span>Necesită verificare</span></div>
   </section>
 
-  <section class="uploads">
-    <div class="panel">
-      <h2>1. Cortex</h2>
-      <p>Lista tuturor șoferilor care lucrează. Pentru „Name des Fahrers” cu mai multe nume separate prin |, se ia numai primul șofer.</p>
-      <form class="upload-form" method="post" action="/admin/mentor/upload-cortex" enctype="multipart/form-data">
-        <input type="hidden" name="work_date" value="{selected}">
-        <input type="file" name="file" accept=".xlsx" required>
-        <button class="btn btn-dark" type="submit">Încarcă Cortex</button>
-      </form>
-    </div>
+  <form method="post" action="/admin/mentor/upload-both" enctype="multipart/form-data">
+    <input type="hidden" name="work_date" value="{selected}">
 
-    <div class="panel">
-      <h2>2. Mentor Shift Report</h2>
-      <p>Lista celor care s-au conectat. Dacă același șofer apare de mai multe ori, este considerat o singură persoană, iar „Prima conectare” este cea mai devreme valoare din Begin Route Time.</p>
-      <form class="upload-form" method="post" action="/admin/mentor/upload-shift" enctype="multipart/form-data">
-        <input type="hidden" name="work_date" value="{selected}">
-        <input type="file" name="file" accept=".xlsx" required>
-        <button class="btn btn-dark" type="submit">Încarcă Mentor</button>
-      </form>
+    <section class="uploads">
+      <div class="panel">
+        <h2>1. Cortex</h2>
+        <p>Lista tuturor șoferilor care lucrează. Pentru „Name des Fahrers” cu mai multe nume separate prin |, se ia numai primul șofer.</p>
+        <div class="upload-form">
+          <input type="file" name="cortex_file" accept=".xlsx" required>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h2>2. Mentor Shift Report</h2>
+        <p>Lista celor care s-au conectat. Dacă același șofer apare de mai multe ori, este considerat o singură persoană, iar „Prima conectare” este cea mai devreme valoare din Begin Route Time.</p>
+        <div class="upload-form">
+          <input type="file" name="mentor_file" accept=".xlsx" required>
+        </div>
+      </div>
+    </section>
+
+    <div class="single-upload-action">
+      <button class="btn btn-dark single-upload-btn" type="submit">Verifică Mentor</button>
     </div>
-  </section>
+  </form>
 
   <section class="table-panel">
     <table>
