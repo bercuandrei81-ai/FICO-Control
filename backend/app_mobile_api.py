@@ -20,6 +20,7 @@ import secrets
 import hmac
 import hashlib
 import threading
+import calendar as pycalendar
 
 DB = "fico.db"
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
@@ -2649,7 +2650,42 @@ def admin_page(request: Request, d: str | None = None, q: str | None = None):
         ORDER BY submitted_at DESC
     """, (selected,)).fetchall()
 
+    try:
+        selected_date_obj = datetime.strptime(selected, "%Y-%m-%d").date()
+    except Exception:
+        selected_date_obj = date.today()
+        selected = selected_date_obj.isoformat()
+
+    month_start = selected_date_obj.replace(day=1)
+    next_month = (
+        month_start.replace(year=month_start.year + 1, month=1)
+        if month_start.month == 12
+        else month_start.replace(month=month_start.month + 1)
+    )
+
+    history_rows = conn.execute("""
+        SELECT r.work_date,
+               COUNT(*) AS total,
+               SUM(CASE WHEN s.id IS NULL THEN 0 ELSE 1 END) AS sent
+        FROM daily_required r
+        LEFT JOIN submissions s
+          ON s.driver_id = r.driver_id
+         AND s.work_date = r.work_date
+        WHERE r.work_date >= ?
+          AND r.work_date < ?
+        GROUP BY r.work_date
+        ORDER BY r.work_date
+    """, (month_start.isoformat(), next_month.isoformat())).fetchall()
+
     conn.close()
+
+    history_by_date = {
+        r["work_date"]: {
+            "total": int(r["total"] or 0),
+            "sent": int(r["sent"] or 0)
+        }
+        for r in history_rows
+    }
 
     total = len(rows)
     sent = sum(int(r["sent"]) for r in rows)
@@ -2851,6 +2887,98 @@ def admin_page(request: Request, d: str | None = None, q: str | None = None):
     else:
         table_content = '<div class="empty">Nu există șoferi pentru această selecție.</div>'
 
+    month_names_ro = [
+        "",
+        "Ianuarie", "Februarie", "Martie", "Aprilie",
+        "Mai", "Iunie", "Iulie", "August",
+        "Septembrie", "Octombrie", "Noiembrie", "Decembrie"
+    ]
+
+    prev_month_date = (
+        month_start.replace(year=month_start.year - 1, month=12)
+        if month_start.month == 1
+        else month_start.replace(month=month_start.month - 1)
+    )
+    next_month_date = next_month
+
+    cal = pycalendar.Calendar(firstweekday=0)
+    calendar_cells = ""
+    today_iso = date.today().isoformat()
+
+    for day_obj in cal.itermonthdates(month_start.year, month_start.month):
+        iso = day_obj.isoformat()
+        day_info = history_by_date.get(iso)
+
+        classes = ["calendar-day"]
+        if day_obj.month != month_start.month:
+            classes.append("outside")
+        if iso == selected:
+            classes.append("selected")
+        if iso == today_iso:
+            classes.append("today")
+        if day_info:
+            classes.append("has-data")
+
+        if day_info:
+            total_d = day_info["total"]
+            sent_d = day_info["sent"]
+            missing_d = max(total_d - sent_d, 0)
+            detail = (
+                f'<span class="calendar-dot"></span>'
+                f'<span class="calendar-count">{sent_d}/{total_d}</span>'
+            )
+            title = (
+                f"{day_obj.strftime('%d.%m.%Y')} · "
+                f"{sent_d} au trimis · {missing_d} lipsesc"
+            )
+        else:
+            detail = ""
+            title = day_obj.strftime("%d.%m.%Y")
+
+        calendar_cells += f"""
+        <a class="{' '.join(classes)}"
+           href="/admin?d={iso}"
+           title="{html.escape(title)}">
+            <span class="calendar-number">{day_obj.day}</span>
+            {detail}
+        </a>
+        """
+
+    calendar_html = f"""
+    <section class="panel calendar-panel">
+        <div class="calendar-header">
+            <div>
+                <div class="import-title">Istoric FICO</div>
+                <div class="calendar-month">
+                    {month_names_ro[month_start.month]} {month_start.year}
+                </div>
+            </div>
+            <div class="calendar-nav">
+                <a class="btn-light calendar-nav-btn"
+                   href="/admin?d={prev_month_date.isoformat()}">‹</a>
+                <a class="btn-light calendar-today"
+                   href="/admin?d={date.today().isoformat()}">Astăzi</a>
+                <a class="btn-light calendar-nav-btn"
+                   href="/admin?d={next_month_date.isoformat()}">›</a>
+            </div>
+        </div>
+
+        <div class="calendar-weekdays">
+            <span>Lu</span><span>Ma</span><span>Mi</span>
+            <span>Jo</span><span>Vi</span><span>Sâ</span><span>Du</span>
+        </div>
+
+        <div class="calendar-grid">
+            {calendar_cells}
+        </div>
+
+        <div class="calendar-legend">
+            <span><i class="legend-dot saved"></i> Zi cu listă salvată</span>
+            <span>Zi afișată: <strong>{selected_date_obj.strftime("%d.%m.%Y")}</strong></span>
+        </div>
+    </section>
+    """
+
     page = f"""
 <!doctype html>
 <html lang="ro">
@@ -2914,8 +3042,29 @@ th{{font-size:13px;color:#667085;text-transform:uppercase;letter-spacing:.4px}}
 .copy-ok{{display:none;margin-left:4px;color:#14804a;font-size:13px;font-weight:800}}
 .copy-ok.show{{display:inline}}
 .empty{{padding:35px;text-align:center;color:#667085}}
+.calendar-panel{{padding:22px}}
+.calendar-header{{display:flex;justify-content:space-between;align-items:center;gap:15px;margin-bottom:16px}}
+.calendar-month{{font-size:24px;font-weight:900;margin-top:3px}}
+.calendar-nav{{display:flex;gap:8px;align-items:center}}
+.calendar-nav-btn{{width:42px;height:42px;padding:0;font-size:24px}}
+.calendar-today{{height:42px}}
+.calendar-weekdays,.calendar-grid{{display:grid;grid-template-columns:repeat(7,1fr);gap:7px}}
+.calendar-weekdays{{margin-bottom:7px}}
+.calendar-weekdays span{{text-align:center;color:#667085;font-size:12px;font-weight:800;padding:4px}}
+.calendar-day{{position:relative;min-height:70px;border:1px solid #e4e7ec;border-radius:12px;padding:9px;text-decoration:none;color:#17212b;background:#fff;transition:.15s ease}}
+.calendar-day:hover{{border-color:#98a2b3;transform:translateY(-1px)}}
+.calendar-day.outside{{opacity:.34}}
+.calendar-day.has-data{{background:#f7fbf8;border-color:#b7e1c8}}
+.calendar-day.selected{{border:2px solid #17212b;background:#f3f5f7}}
+.calendar-day.today .calendar-number{{background:#17212b;color:#fff;border-radius:999px;min-width:27px;height:27px;display:inline-flex;align-items:center;justify-content:center}}
+.calendar-number{{font-weight:900;font-size:14px}}
+.calendar-dot{{position:absolute;left:10px;bottom:11px;width:8px;height:8px;border-radius:50%;background:#14804a}}
+.calendar-count{{position:absolute;right:9px;bottom:9px;font-size:11px;font-weight:800;color:#14804a}}
+.calendar-legend{{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-top:14px;color:#667085;font-size:12px}}
+.legend-dot{{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:5px}}
+.legend-dot.saved{{background:#14804a}}
 @media(max-width:850px){{.stats{{grid-template-columns:repeat(2,1fr)}}.topbar{{display:block}}.top-actions{{margin-top:18px}}}}
-@media(max-width:520px){{.stats{{grid-template-columns:1fr}}h1{{font-size:30px}}.search{{min-width:100%;width:100%}}.control-group{{width:100%}}}}
+@media(max-width:520px){{.stats{{grid-template-columns:1fr}}h1{{font-size:30px}}.search{{min-width:100%;width:100%}}.control-group{{width:100%}}.calendar-panel{{padding:14px}}.calendar-header{{align-items:flex-start}}.calendar-month{{font-size:20px}}.calendar-day{{min-height:54px;padding:7px}}.calendar-count{{display:none}}}}
 </style>
 </head>
 <body>
@@ -2950,6 +3099,8 @@ th{{font-size:13px;color:#667085;text-transform:uppercase;letter-spacing:.4px}}
     <div class="card alert"><strong>{low_fico}</strong><span>FICO sub 800</span></div>
     <div class="card alert"><strong>{needs_review}</strong><span>Necesită verificare</span></div>
 </section>
+
+{calendar_html}
 
 <section class="panel">
     <div class="controls">
