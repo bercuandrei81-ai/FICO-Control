@@ -362,7 +362,8 @@ def send_owner_verification_code(code: str):
         data=payload,
         headers={
             "Authorization": f"Bearer {RESEND_API_KEY}",
-            "Content-Type": "application/json"
+            "Content-Type": "application/json",
+            "User-Agent": "FICO-Control/1.0"
         },
         method="POST"
     )
@@ -785,7 +786,13 @@ def forgot_password_send_code():
 
     try:
         send_owner_verification_code(code)
-    except Exception:
+    except Exception as exc:
+        print(
+            "RESEND_PASSWORD_RESET_ERROR:",
+            type(exc).__name__,
+            str(exc)[:500],
+            flush=True
+        )
         return forgot_password_page(
             error="Codul nu a putut fi trimis. Verifică setările de email."
         )
@@ -893,6 +900,12 @@ def owner_send_code(request: Request):
     try:
         send_owner_verification_code(code)
     except Exception as exc:
+        print(
+            "RESEND_OWNER_EMAIL_ERROR:",
+            type(exc).__name__,
+            str(exc)[:500],
+            flush=True
+        )
         return HTMLResponse(
             owner_gate_html(
                 "Codul nu a putut fi trimis. Verifică setările de email din Render.",
