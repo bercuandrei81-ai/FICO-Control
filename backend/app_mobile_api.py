@@ -940,6 +940,36 @@ SITE_LANGUAGE_SCRIPT = r'''
 </script>
 '''
 
+SITE_DARK_BACKGROUND_STYLE = r'''
+<style id="fico-dark-admin-background">
+html{background:#07111d}
+body{
+  min-height:100vh;
+  background:
+    linear-gradient(rgba(5,14,25,.88),rgba(5,14,25,.93)),
+    url('/login-background?v=mr-logistics-fleet-plates-4') center center/cover fixed no-repeat !important;
+}
+.admin>.topbar h1,.admin>.topbar .brand,
+.pc-top h1,.pc-top .pc-brand,
+.cn-top h1,.cn-top .cn-brand,
+main>.topbar h1,main>.topbar .brand,
+.wrap>.topbar h1,.wrap>.topbar .brand{
+  color:#fff !important;
+  text-shadow:0 2px 12px rgba(0,0,0,.35);
+}
+.admin>.topbar>div>div[style],
+.pc-top .pc-sub,.cn-top .cn-sub,
+main>.topbar .subtitle,.wrap>.topbar .subtitle{
+  color:#cbd5e1 !important;
+}
+.side-brand{color:#cbd5e1 !important}
+.app-shell,.admin,.pc-wrap,.cn-wrap,.wrap{position:relative;z-index:1}
+@media(max-width:760px){
+  body{background-position:center top !important;background-attachment:scroll !important}
+}
+</style>
+'''
+
 
 @app.middleware("http")
 async def persist_site_language(request: Request, call_next):
@@ -952,7 +982,23 @@ async def persist_site_language(request: Request, call_next):
         body += chunk
     page = body.decode("utf-8", errors="replace")
     if "</body>" in page:
-        page = page.replace("</body>", SITE_LANGUAGE_SCRIPT + "</body>", 1)
+        public_light_pages = (
+            "/admin/login",
+            "/admin/forgot-password",
+            "/admin/reset-password",
+            "/admin/setup-name"
+        )
+        dark_style = (
+            SITE_DARK_BACKGROUND_STYLE
+            if request.url.path.startswith("/admin")
+            and not request.url.path.startswith(public_light_pages)
+            else ""
+        )
+        page = page.replace(
+            "</body>",
+            dark_style + SITE_LANGUAGE_SCRIPT + "</body>",
+            1
+        )
     headers = dict(response.headers)
     headers.pop("content-length", None)
     return Response(
