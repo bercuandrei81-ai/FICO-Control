@@ -21,6 +21,8 @@ import hmac
 import hashlib
 import threading
 import calendar as pycalendar
+import zipfile
+from zoneinfo import ZoneInfo
 
 DB = "fico.db"
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
@@ -88,6 +90,10 @@ def storage_backend_name():
 
 
 app = FastAPI(title="FICO Control")
+
+HOURS_MAX_UPLOAD_BYTES = 15 * 1024 * 1024
+HOURS_MAX_CSV_BYTES = 12 * 1024 * 1024
+BERLIN_TZ = ZoneInfo("Europe/Berlin")
 
 
 def _pg_translate_sql(sql: str) -> str:
@@ -2577,6 +2583,206 @@ async def mentor_upload_both(
     )
 
 
+def parse_hours_timestamp(value: str) -> datetime:
+    clean = (value or "").strip()
+    if not clean:
+        raise ValueError("missing timestamp")
+    return datetime.fromisoformat(clean.replace("Z", "+00:00"))
+
+
+def merge_work_intervals(intervals):
+    merged = []
+    for start_at, end_at in sorted(intervals, key=lambda item: (item[0], item[1])):
+        if not merged or start_at > merged[-1][1]:
+            merged.append([start_at, end_at])
+        elif end_at > merged[-1][1]:
+            merged[-1][1] = end_at
+    return merged
+
+
+def parse_service_details_csv(csv_bytes: bytes):
+    text = csv_bytes.decode("utf-8-sig")
+    reader = csv.DictReader(io.StringIO(text))
+    required = {"Datum", "Zustellmitarbeiter", "Anmelden", "Abmelden"}
+    if not reader.fieldnames or not required.issubset(set(reader.fieldnames)):
+        raise ValueError("Raportul nu conține coloanele necesare.")
+
+    grouped = {}
+    for row in reader:
+        driver = (row.get("Zustellmitarbeiter") or "").strip()
+        work_date = (row.get("Datum") or "").strip()
+        if not driver or not work_date:
+            continue
+        try:
+            start_at = parse_hours_timestamp(row.get("Anmelden") or "")
+            end_at = parse_hours_timestamp(row.get("Abmelden") or "")
+        except (TypeError, ValueError):
+            continue
+        if end_at <= start_at:
+            continue
+
+        key = (work_date, driver)
+        group = grouped.setdefault(key, {"intervals": set(), "routes": set()})
+        group["intervals"].add((start_at, end_at))
+        route = (row.get("Route") or "").strip()
+        if route:
+            group["routes"].add(route)
+
+    results = []
+    for (work_date, driver), group in grouped.items():
+        merged = merge_work_intervals(group["intervals"])
+        total_seconds = int(sum((end - start).total_seconds() for start, end in merged))
+        if not merged or total_seconds <= 0:
+            continue
+        total_minutes = total_seconds // 60
+        first_start = min(start for start, _ in merged).astimezone(BERLIN_TZ)
+        last_end = max(end for _, end in merged).astimezone(BERLIN_TZ)
+        if total_minutes >= 630:
+            status = "critical"
+        elif total_minutes > 600:
+            status = "warning"
+        else:
+            status = "safe"
+        results.append({
+            "date": work_date,
+            "name": driver,
+            "start": first_start.strftime("%H:%M"),
+            "end": last_end.strftime("%H:%M"),
+            "minutes": total_minutes,
+            "seconds": total_seconds,
+            "blocks": len(merged),
+            "routes": sorted(group["routes"]),
+            "status": status
+        })
+    return sorted(results, key=lambda row: (row["date"], row["name"].casefold()))
+
+
+def read_hours_report(upload_name: str, payload: bytes):
+    lower_name = (upload_name or "").lower()
+    if len(payload) > HOURS_MAX_UPLOAD_BYTES:
+        raise ValueError("Fișierul este prea mare. Limita este 15 MB.")
+
+    if lower_name.endswith(".csv"):
+        if len(payload) > HOURS_MAX_CSV_BYTES:
+            raise ValueError("Raportul CSV este prea mare.")
+        return parse_service_details_csv(payload)
+
+    if not lower_name.endswith(".zip"):
+        raise ValueError("Încarcă arhiva ZIP sau Service Details Report CSV.")
+
+    try:
+        with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+            candidates = [
+                info for info in archive.infolist()
+                if not info.is_dir()
+                and re.search(r"service details report.*\.csv$", info.filename, re.IGNORECASE)
+            ]
+            if not candidates:
+                raise ValueError("Arhiva nu conține Service Details Report CSV.")
+            report = candidates[0]
+            if report.file_size > HOURS_MAX_CSV_BYTES:
+                raise ValueError("Raportul din arhivă este prea mare.")
+            return parse_service_details_csv(archive.read(report))
+    except zipfile.BadZipFile as exc:
+        raise ValueError("Arhiva ZIP nu este validă.") from exc
+
+
+def hours_control_html(results=None, filename="", error=""):
+    results = results or []
+    payload_json = json.dumps(results, ensure_ascii=False).replace("</", "<\\/")
+    filename_safe = html.escape(filename)
+    error_html = (
+        f'<div class="error"><strong>Raportul nu a putut fi analizat.</strong>'
+        f'<span>{html.escape(error)}</span></div>'
+        if error else ""
+    )
+    file_status = (
+        f'<strong>{filename_safe}</strong><small>Raport analizat în memorie · fișierul nu a fost salvat</small>'
+        if results else
+        '<strong>Niciun raport încărcat</strong><small>ZIP săptămânal sau Service Details CSV</small>'
+    )
+    return f"""
+<!doctype html>
+<html lang="ro">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Control ore · FICO Control</title>
+<style>
+*{{box-sizing:border-box}}:root{{--ink:#17212b;--muted:#667085;--line:#d8dde3;--safe:#14804a;--warn:#d98b12;--critical:#d13b2e}}
+body{{margin:0;background:#f4f6f8;color:var(--ink);font-family:Arial,Helvetica,sans-serif}}
+.wrap{{width:min(96%,1280px);margin:28px auto 60px}}.topbar{{display:flex;justify-content:space-between;align-items:flex-start;gap:18px;margin-bottom:22px}}
+.brand{{font-size:13px;font-weight:900;letter-spacing:2px}}h1{{font-size:38px;margin:10px 0 6px}}.subtitle{{color:var(--muted);font-size:13px}}
+.actions{{display:flex;gap:9px;flex-wrap:wrap}}.btn{{display:inline-flex;align-items:center;justify-content:center;text-decoration:none;border:0;border-radius:10px;padding:12px 15px;font-weight:800;cursor:pointer}}
+.btn-dark{{background:var(--ink);color:#fff}}.btn-light{{background:#fff;color:var(--ink);border:1px solid var(--line)}}
+.hero{{display:grid;grid-template-columns:1fr auto;gap:22px;align-items:center;background:linear-gradient(120deg,#0d4f6b,#177e9c);color:#fff;border-radius:18px;padding:28px;margin-bottom:16px}}
+.hero h2{{margin:0 0 8px;font-size:27px}}.hero p{{margin:0;color:#d5edf3;line-height:1.55}}.upload{{display:flex;align-items:center;gap:10px;flex-wrap:wrap;background:#fff;padding:12px;border-radius:12px}}
+.upload input{{max-width:320px;color:var(--ink)}}.file-row{{display:flex;gap:10px;align-items:center;background:#fff;border:1px solid #e4e7ec;border-radius:14px;padding:15px 18px;margin-bottom:16px}}
+.file-row i{{width:10px;height:10px;border-radius:50%;background:{'#14804a' if results else '#98a2b3'}}}.file-row div{{display:flex;flex-direction:column;gap:3px}}.file-row small{{color:var(--muted)}}
+.error{{display:flex;flex-direction:column;gap:4px;background:#fff0f0;color:#9f2f27;border-left:4px solid var(--critical);padding:14px 16px;margin-bottom:15px}}
+.controls{{display:grid;grid-template-columns:220px 1fr auto;gap:12px;align-items:end;margin-bottom:16px}}label{{display:flex;flex-direction:column;gap:6px;color:var(--muted);font-size:12px;font-weight:800}}
+select,input[type=search]{{height:45px;border:1px solid var(--line);border-radius:9px;background:#fff;padding:0 12px;font-size:14px}}.export{{height:45px}}
+.stats{{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin-bottom:16px}}.stat{{display:grid;grid-template-columns:1fr auto;align-items:center;background:#fff;border-radius:15px;padding:19px;border:1px solid #e4e7ec}}
+.stat span{{color:var(--muted);font-size:13px;font-weight:800}}.stat strong{{grid-row:1/3;grid-column:2;font-size:36px}}.stat small{{color:#98a2b3;margin-top:5px}}.stat.warn{{border-top:4px solid var(--warn)}}.stat.warn strong{{color:#ae6e0a}}.stat.critical{{border-top:4px solid var(--critical)}}.stat.critical strong{{color:var(--critical)}}
+.panel{{background:#fff;border:1px solid #e4e7ec;border-radius:16px;overflow:hidden}}.panel-head{{display:flex;justify-content:space-between;gap:18px;align-items:center;padding:19px;border-bottom:1px solid #e8ebef}}.panel-head h2{{margin:0 0 5px;font-size:20px}}.panel-head p{{margin:0;color:var(--muted);font-size:12px}}
+.legend{{display:flex;gap:13px;color:var(--muted);font-size:11px;white-space:nowrap}}.legend span{{display:flex;gap:5px;align-items:center}}.legend i{{width:8px;height:8px;border-radius:50%}}
+.dot-safe{{background:var(--safe)}}.dot-warn{{background:var(--warn)}}.dot-critical{{background:var(--critical)}}.table-wrap{{overflow-x:auto}}table{{width:100%;border-collapse:collapse;min-width:820px}}
+th,td{{text-align:left;padding:14px 15px;border-bottom:1px solid #edf0f2}}th{{font-size:11px;color:var(--muted);background:#fafafa;text-transform:uppercase;letter-spacing:.5px}}td strong,td small{{display:block}}td small{{color:#98a2b3;margin-top:4px}}
+tr.warning{{background:#fffaf0}}tr.critical{{background:#fff1f1}}tr.warning td:first-child{{border-left:4px solid var(--warn)}}tr.critical td:first-child{{border-left:4px solid var(--critical)}}.hours{{font-size:18px;font-weight:900}}
+.badge{{display:inline-flex;align-items:center;gap:6px;border-radius:999px;padding:6px 9px;font-size:11px;font-weight:900}}.badge.safe{{background:#e9f8ef;color:var(--safe)}}.badge.warning{{background:#fff1d6;color:#9a6208}}.badge.critical{{background:#fde2e1;color:#b42318}}.empty{{padding:38px;text-align:center;color:var(--muted)}}
+@media(max-width:850px){{.topbar{{display:block}}.actions{{margin-top:15px}}.hero{{grid-template-columns:1fr}}.controls{{grid-template-columns:1fr}}.stats{{grid-template-columns:1fr}}.panel-head{{align-items:flex-start;flex-direction:column}}}}
+</style>
+</head>
+<body><main class="wrap">
+<div class="topbar"><div><div class="brand">FICO CONTROL</div><h1>Control ore șoferi</h1><div class="subtitle">Verificare zilnică după Anmelden și Abmelden · limita maximă 10h 30m</div></div>
+<div class="actions"><a class="btn btn-light" href="/admin">FICO Dashboard</a><a class="btn btn-light" href="/admin/mentor">Mentor Check</a><a class="btn btn-light" href="/admin/owner">Owner</a></div></div>
+{error_html}
+<section class="hero"><div><h2>Încarcă raportul săptămânal Amazon</h2><p>Este detectat automat „Service Details Report”. Dublurile identice și intervalele suprapuse nu sunt adunate de două ori.</p></div>
+<form class="upload" method="post" action="/admin/hours" enctype="multipart/form-data"><input type="file" name="report_file" accept=".zip,.csv" required><button class="btn btn-dark" type="submit">Verifică orele</button></form></section>
+<div class="file-row"><i></i><div>{file_status}</div></div>
+<section class="controls"><label>Data verificării<select id="dateSelect"></select></label><label>Caută șofer<input id="searchInput" type="search" placeholder="Scrie un nume..."></label><button class="btn btn-light export" id="exportBtn" type="button">Descarcă CSV</button></section>
+<section class="stats"><div class="stat"><div><span>Șoferi verificați</span><small>cu ore reale</small></div><strong id="totalCount">0</strong></div><div class="stat warn"><div><span>Peste 10 ore</span><small>necesită atenție</small></div><strong id="warningCount">0</strong></div><div class="stat critical"><div><span>10h 30m sau mai mult</span><small>limită critică</small></div><strong id="criticalCount">0</strong></div></section>
+<section class="panel"><div class="panel-head"><div><h2 id="tableTitle">Ore lucrate</h2><p>Ora Germaniei · fișierele nu sunt păstrate</p></div><div class="legend"><span><i class="dot-safe"></i>≤10h</span><span><i class="dot-warn"></i>10h01–10h29</span><span><i class="dot-critical"></i>≥10h30</span></div></div><div class="table-wrap"><table><thead><tr><th>Șofer</th><th>Interval real</th><th>Blocuri</th><th>Total lucrat</th><th>Status</th></tr></thead><tbody id="hoursBody"></tbody></table></div></section>
+</main><script>
+const reportData={payload_json};
+const dateSelect=document.getElementById('dateSelect'), searchInput=document.getElementById('searchInput'), body=document.getElementById('hoursBody');
+const dates=[...new Set(reportData.map(r=>r.date))].sort();
+for(const d of dates){{const o=document.createElement('option');o.value=d;o.textContent=d.split('-').reverse().join('.');dateSelect.appendChild(o)}}
+if(dates.length) dateSelect.value=dates[dates.length-1]; else {{const o=document.createElement('option');o.textContent='Nicio dată';dateSelect.appendChild(o);dateSelect.disabled=true}}
+function duration(m){{return Math.floor(m/60)+'h '+String(m%60).padStart(2,'0')+'m'}}
+function escapeHtml(v){{return String(v??'').replace(/[&<>\"']/g,c=>({{'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',"'":'&#039;'}}[c]))}}
+function statusLabel(s){{return s==='critical'?'‼ LIMITĂ ATINSĂ':s==='warning'?'! ATENȚIE':'✓ ÎN REGULĂ'}}
+function currentRows(){{const q=searchInput.value.trim().toLocaleLowerCase('ro');return reportData.filter(r=>r.date===dateSelect.value&&r.name.toLocaleLowerCase('ro').includes(q))}}
+function render(){{const rows=currentRows();document.getElementById('totalCount').textContent=rows.length;document.getElementById('warningCount').textContent=rows.filter(r=>r.status==='warning').length;document.getElementById('criticalCount').textContent=rows.filter(r=>r.status==='critical').length;document.getElementById('tableTitle').textContent='Ore lucrate · '+(dateSelect.value?dateSelect.value.split('-').reverse().join('.'):'—');
+body.innerHTML=rows.length?rows.map(r=>`<tr class="${{r.status}}"><td><strong>${{escapeHtml(r.name)}}</strong><small>${{escapeHtml(r.routes.join(' · '))}}</small></td><td>${{r.start}} — ${{r.end}}</td><td>${{r.blocks}}</td><td class="hours" title="${{r.seconds}} secunde">${{duration(r.minutes)}}</td><td><span class="badge ${{r.status}}">${{statusLabel(r.status)}}</span></td></tr>`).join(''):'<tr><td class="empty" colspan="5">Încarcă raportul pentru a vedea orele lucrate.</td></tr>'}}
+dateSelect.addEventListener('change',render);searchInput.addEventListener('input',render);render();
+document.getElementById('exportBtn').addEventListener('click',()=>{{const rows=currentRows();if(!rows.length)return;const lines=[['Data','Șofer','Început','Sfârșit','Ore lucrate','Status','Rute'],...rows.map(r=>[r.date,r.name,r.start,r.end,duration(r.minutes),statusLabel(r.status),r.routes.join(' / ')])];const csv='\uFEFF'+lines.map(row=>row.map(v=>'"'+String(v).replaceAll('"','""')+'"').join(',')).join('\n');const url=URL.createObjectURL(new Blob([csv],{{type:'text/csv;charset=utf-8'}}));const a=document.createElement('a');a.href=url;a.download='ore-soferi-'+dateSelect.value+'.csv';a.click();URL.revokeObjectURL(url)}});
+</script></body></html>
+"""
+
+
+@app.get("/admin/hours", response_class=HTMLResponse)
+def hours_control_page():
+    return HTMLResponse(hours_control_html())
+
+
+@app.post("/admin/hours", response_class=HTMLResponse)
+async def hours_control_upload(report_file: UploadFile = File(...)):
+    try:
+        payload = await report_file.read(HOURS_MAX_UPLOAD_BYTES + 1)
+        results = read_hours_report(report_file.filename or "", payload)
+        if not results:
+            raise ValueError("Raportul nu conține ore reale valide.")
+        return HTMLResponse(hours_control_html(results, report_file.filename or "Raport"))
+    except ValueError as exc:
+        return HTMLResponse(
+            hours_control_html(filename=report_file.filename or "", error=str(exc)),
+            status_code=400
+        )
+    finally:
+        await report_file.close()
+
+
 @app.get("/admin/mentor", response_class=HTMLResponse)
 def mentor_check_page(request: Request, d: str | None = None):
     selected = d or date.today().isoformat()
@@ -2717,6 +2923,7 @@ th{{font-size:12px;color:#667085;background:#fafafa}}
     </div>
     <div class="actions">
       <a class="btn btn-light" href="/admin?d={selected}">FICO Dashboard</a>
+      <a class="btn btn-light" href="/admin/hours">Control ore</a>
       <a class="btn btn-light" href="/admin/owner">Owner</a>
       <button class="btn btn-dark" type="button" onclick="copyMissing()">Copiază șoferii lipsă</button>
     </div>
@@ -3734,6 +3941,7 @@ th{{font-size:13px;color:#667085;text-transform:uppercase;letter-spacing:.4px}}
 
     <div class="top-actions">
         <a class="btn-light" href="/admin/mentor?d={selected}">Mentor Check</a>
+        <a class="btn-light" href="/admin/hours">Control ore</a>
         <a class="btn-light" href="/admin/owner">Owner</a>
         <form method="post" action="/admin/logout" style="margin:0">
             <button class="btn-light" type="submit">Ieșire</button>
