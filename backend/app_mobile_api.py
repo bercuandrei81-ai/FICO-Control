@@ -898,6 +898,7 @@ def admin_login_page(request: Request, next: str | None = None, error: str | Non
 *{{box-sizing:border-box}}
 body{{margin:0;min-height:100vh;background:#101820 url('/login-background') center center/cover no-repeat fixed;font-family:Arial,sans-serif;color:#17212b;position:relative}}
 body::before{{content:"";position:fixed;inset:0;background:linear-gradient(90deg,rgba(4,12,22,.13),rgba(4,12,22,.22) 48%,rgba(4,12,22,.46));pointer-events:none}}
+.background-brand{{position:fixed;z-index:1;left:34px;top:28px;color:#fff;font-size:17px;font-weight:900;letter-spacing:3px;text-shadow:0 2px 12px rgba(0,0,0,.65)}}
 .wrap{{position:relative;z-index:1;width:min(92%,470px);margin:0 max(5vw,70px) 0 auto;min-height:100vh;display:flex;align-items:center;padding:32px 0}}
 .card{{width:100%;background:rgba(255,255,255,.96);border:1px solid rgba(255,255,255,.65);backdrop-filter:blur(8px);border-radius:22px;padding:30px;box-shadow:0 18px 55px rgba(0,0,0,.30)}}
 .brand{{font-size:13px;font-weight:900;letter-spacing:2px}}
@@ -922,12 +923,14 @@ button{{margin-top:22px;border:0;background:#17212b;color:#fff;font-weight:800;c
 @media(max-width:760px){{
  body{{background-position:38% center;background-attachment:scroll}}
  body::before{{background:rgba(4,12,22,.42)}}
+ .background-brand{{left:18px;top:16px;font-size:13px;letter-spacing:2px}}
  .wrap{{margin:0 auto;padding:22px 0}}
  .card{{padding:24px}}
 }}
 </style>
 </head>
 <body>
+<div class="background-brand">MR LOGISTICS</div>
 <div class="wrap">
 <div class="card">
 <div class="langs">
