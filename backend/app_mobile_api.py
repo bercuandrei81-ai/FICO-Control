@@ -2888,98 +2888,64 @@ def build_quality_workbook(report_kind, report_date, groups):
     sheet.title = report_kind
     sheet.sheet_view.showGridLines = False
     if report_kind == "POD":
-        headers = ["Nr.", "Tracking ID", "Delivery / Attempt Reason", "POD Audit"]
+        headers = ["Date", "Tracking ID", "Driver Name", "Delivery/Attempt Reason", "POD Audit", "Total Cases"]
         detail_keys = ["Tracking ID", "Delivery/Attempt Reason", "POD Audit"]
-        widths = [8, 22, 42, 34]
+        widths = [15, 22, 32, 46, 32, 15]
     else:
-        headers = ["Nr.", "Tracking ID", "Delivery / Attempt Reason", "CC Type", "Call Duration (sec.)"]
+        headers = ["Date", "Tracking ID", "Driver Name", "Delivery/Attempt Reason", "CC Type", "Call Duration (Seconds)", "Total Cases"]
         detail_keys = ["Tracking ID", "Delivery/Attempt Reason", "CC Type", "Call Duration (Seconds)"]
-        widths = [8, 22, 48, 24, 22]
+        widths = [15, 22, 32, 54, 24, 24, 15]
     last_col = len(headers)
-    dark = "17212B"
-    red = "D92D20"
-    red_light = "FDE8E7"
-    yellow = "F4B740"
-    yellow_light = "FFF5D6"
-    blue = "0E7490"
-    white = "FFFFFF"
-    muted = "667085"
-    thin = openpyxl.styles.Side(style="thin", color="DDE2E7")
+    title_green = "DCEED6"
+    header_green = "EDF6E9"
+    high_fill = "FDE8E7"
+    single_fill = "FFF8E6"
+    ink = "17212B"
+    grid = openpyxl.styles.Side(style="thin", color="4B5563")
+    report_day = date.fromisoformat(report_date)
+    report_day_text = report_day.strftime("%d.%m.%Y")
 
     sheet.merge_cells(start_row=1, start_column=1, end_row=1, end_column=last_col)
-    title = sheet.cell(1, 1, f"MR LOGISTICS · RAPORT {report_kind}")
-    title.font = openpyxl.styles.Font(name="Arial", size=18, bold=True, color=white)
-    title.fill = openpyxl.styles.PatternFill("solid", fgColor=dark)
-    title.alignment = openpyxl.styles.Alignment(vertical="center")
-    sheet.row_dimensions[1].height = 36
-    sheet.merge_cells(start_row=2, start_column=1, end_row=2, end_column=last_col)
-    subtitle = sheet.cell(2, 1, f"Data raportului: {report_date[8:10]}.{report_date[5:7]}.{report_date[:4]}  ·  Șoferii cu cele mai multe cazuri sunt afișați primii")
-    subtitle.font = openpyxl.styles.Font(name="Arial", size=10, color=muted)
-    subtitle.alignment = openpyxl.styles.Alignment(vertical="center")
-    sheet.row_dimensions[2].height = 24
-
-    total_cases = sum(len(group["items"]) for group in groups)
-    high_risk = sum(1 for group in groups if len(group["items"]) >= 2)
-    cards = [("TOTAL CAZURI", total_cases), ("ȘOFERI", len(groups)), ("ATENȚIE 2+", high_risk)]
-    for index, (label, value) in enumerate(cards):
-        col = 1 + index
-        cell = sheet.cell(4, col, f"{label}\n{value}")
-        cell.font = openpyxl.styles.Font(name="Arial", size=11, bold=True, color=white)
-        cell.fill = openpyxl.styles.PatternFill("solid", fgColor=blue if index < 2 else red)
+    title = sheet.cell(1, 1, f"{report_kind} – {report_day.strftime('%d.%m.%Y')}")
+    title.font = openpyxl.styles.Font(name="Arial", size=17, bold=True, color=ink)
+    title.fill = openpyxl.styles.PatternFill("solid", fgColor=title_green)
+    title.alignment = openpyxl.styles.Alignment(horizontal="center", vertical="center")
+    sheet.row_dimensions[1].height = 34
+    for col, header in enumerate(headers, start=1):
+        cell = sheet.cell(2, col, header)
+        cell.font = openpyxl.styles.Font(name="Arial", size=11, bold=True, color=ink)
+        cell.fill = openpyxl.styles.PatternFill("solid", fgColor=header_green)
         cell.alignment = openpyxl.styles.Alignment(horizontal="center", vertical="center", wrap_text=True)
-    if last_col > 3:
-        sheet.merge_cells(start_row=4, start_column=3, end_row=4, end_column=last_col)
-    sheet.row_dimensions[4].height = 46
+        cell.border = openpyxl.styles.Border(left=grid, right=grid, top=grid, bottom=grid)
+    sheet.row_dimensions[2].height = 27
 
-    current_row = 6
-    sections = [
-        ("ATENȚIE · 2 SAU MAI MULTE CAZURI", [group for group in groups if len(group["items"]) >= 2], red),
-        ("UN SINGUR CAZ", [group for group in groups if len(group["items"]) == 1], yellow),
-    ]
-    driver_number = 1
-    for section_title, section_groups, color in sections:
-        if not section_groups:
-            continue
-        sheet.merge_cells(start_row=current_row, start_column=1, end_row=current_row, end_column=last_col)
-        section_cell = sheet.cell(current_row, 1, section_title)
-        section_cell.font = openpyxl.styles.Font(name="Arial", size=11, bold=True, color=white if color == red else dark)
-        section_cell.fill = openpyxl.styles.PatternFill("solid", fgColor=color)
-        section_cell.alignment = openpyxl.styles.Alignment(vertical="center")
-        sheet.row_dimensions[current_row].height = 25
-        current_row += 1
-        for group in section_groups:
-            count = len(group["items"])
-            fill = red_light if count >= 2 else yellow_light
-            sheet.merge_cells(start_row=current_row, start_column=1, end_row=current_row, end_column=last_col)
-            driver_cell = sheet.cell(current_row, 1, f"{driver_number}. {group['name']}  ·  {count} {'cazuri' if count != 1 else 'caz'}")
-            driver_cell.font = openpyxl.styles.Font(name="Arial", size=12, bold=True, color=dark)
-            driver_cell.fill = openpyxl.styles.PatternFill("solid", fgColor=fill)
-            driver_cell.alignment = openpyxl.styles.Alignment(vertical="center")
-            sheet.row_dimensions[current_row].height = 27
+    current_row = 3
+    for group in groups:
+        total_cases = len(group["items"])
+        row_fill = high_fill if total_cases >= 2 else single_fill
+        for item in group["items"]:
+            details = [item.get(key, "") for key in detail_keys]
+            values = [report_day_text, details[0], group["name"], *details[1:], total_cases]
+            for col, value in enumerate(values, start=1):
+                cell = sheet.cell(current_row, col, value)
+                cell.font = openpyxl.styles.Font(name="Arial", size=10, bold=col in {3, last_col}, color=ink)
+                cell.fill = openpyxl.styles.PatternFill("solid", fgColor=row_fill)
+                cell.border = openpyxl.styles.Border(left=grid, right=grid, top=grid, bottom=grid)
+                cell.alignment = openpyxl.styles.Alignment(
+                    horizontal="center" if col in {1, last_col} else "left",
+                    vertical="center",
+                    wrap_text=True
+                )
+            sheet.row_dimensions[current_row].height = 29
             current_row += 1
-            for col, header in enumerate(headers, start=1):
-                cell = sheet.cell(current_row, col, header)
-                cell.font = openpyxl.styles.Font(name="Arial", size=9, bold=True, color=white)
-                cell.fill = openpyxl.styles.PatternFill("solid", fgColor=dark)
-                cell.alignment = openpyxl.styles.Alignment(vertical="center")
-            current_row += 1
-            for item_number, item in enumerate(group["items"], start=1):
-                values = [item_number] + [item.get(key, "") for key in detail_keys]
-                for col, value in enumerate(values, start=1):
-                    cell = sheet.cell(current_row, col, value)
-                    cell.font = openpyxl.styles.Font(name="Arial", size=10, color=dark)
-                    cell.alignment = openpyxl.styles.Alignment(vertical="top", wrap_text=True)
-                    cell.border = openpyxl.styles.Border(bottom=thin)
-                    if col == 1:
-                        cell.alignment = openpyxl.styles.Alignment(horizontal="center", vertical="top")
-                sheet.row_dimensions[current_row].height = 31
-                current_row += 1
-            current_row += 1
-            driver_number += 1
     for column, width in enumerate(widths, start=1):
         sheet.column_dimensions[openpyxl.utils.get_column_letter(column)].width = width
-    sheet.freeze_panes = "A6"
-    sheet.auto_filter.ref = f"A6:{openpyxl.utils.get_column_letter(last_col)}{max(6, current_row - 1)}"
+    sheet.freeze_panes = "A3"
+    sheet.auto_filter.ref = f"A2:{openpyxl.utils.get_column_letter(last_col)}{max(2, current_row - 1)}"
+    sheet.print_title_rows = "1:2"
+    sheet.page_setup.orientation = "landscape"
+    sheet.page_setup.fitToWidth = 1
+    sheet.sheet_properties.pageSetUpPr.fitToPage = True
     output = io.BytesIO()
     workbook.save(output)
     workbook.close()
