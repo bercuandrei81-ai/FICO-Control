@@ -4267,14 +4267,14 @@ def admin_page(request: Request, d: str | None = None, q: str | None = None):
 <style>
 *{{box-sizing:border-box}}
 body{{margin:0;font-family:Arial,Helvetica,sans-serif;background:#f4f6f8;color:#17212b}}
-.app-shell{{width:min(97%,1540px);margin:28px auto 60px;display:grid;grid-template-columns:210px minmax(0,1fr);gap:24px;align-items:start}}
+.app-shell{{width:min(96%,1280px);margin:28px auto 60px;display:block}}
 .admin{{width:100%;min-width:0;margin:0}}
-.side-nav{{position:sticky;top:22px;z-index:2;background:#17212b;color:#fff;border-radius:18px;padding:18px;box-shadow:0 7px 22px rgba(23,33,43,.16)}}
-.side-brand{{font-size:11px;font-weight:900;letter-spacing:1.8px;color:#aeb8c4;margin:3px 4px 16px}}
+.side-nav{{position:fixed;left:18px;top:18px;z-index:20;width:170px;background:transparent;color:#17212b;padding:0}}
+.side-brand{{font-size:10px;font-weight:800;letter-spacing:1.5px;color:#98a2b3;margin:0 3px 9px}}
 .side-nav-links{{display:flex;flex-direction:column;gap:9px}}
-.side-link{{display:flex;align-items:center;gap:10px;color:#fff;text-decoration:none;padding:13px 12px;border-radius:10px;font-size:14px;font-weight:800;border:1px solid rgba(255,255,255,.13);background:rgba(255,255,255,.055)}}
-.side-link:hover{{background:rgba(255,255,255,.14)}}
-.side-link i{{width:9px;height:9px;border-radius:50%;background:#22b5e5;flex:0 0 auto}}
+.side-link{{display:flex;align-items:center;color:#17212b;text-decoration:none;padding:11px 12px;border-radius:9px;font-size:13px;font-weight:700;border:1px solid #d8dde3;background:#fff;box-shadow:0 2px 7px rgba(23,33,43,.04)}}
+.side-link:hover{{background:#f8fafb;border-color:#b8c0ca}}
+.side-link i{{display:none}}
 .topbar{{display:flex;align-items:flex-start;justify-content:space-between;gap:20px;margin-bottom:28px}}
 .brand{{font-size:13px;font-weight:800;letter-spacing:2px}}
 h1{{font-size:38px;margin:14px 0 0}}
@@ -4348,7 +4348,7 @@ th{{font-size:13px;color:#667085;text-transform:uppercase;letter-spacing:.4px}}
 .calendar-legend{{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-top:14px;color:#667085;font-size:12px}}
 .legend-dot{{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:5px}}
 .legend-dot.saved{{background:#14804a}}
-@media(max-width:1000px){{.app-shell{{grid-template-columns:1fr}}.side-nav{{position:static}}.side-nav-links{{display:grid;grid-template-columns:repeat(4,1fr)}}.side-link{{justify-content:center}}}}
+@media(max-width:1500px){{.side-nav{{position:static;width:100%;margin-bottom:16px}}.side-brand{{display:none}}.side-nav-links{{display:grid;grid-template-columns:repeat(4,1fr)}}.side-link{{justify-content:center}}}}
 @media(max-width:850px){{.stats{{grid-template-columns:repeat(2,1fr)}}.topbar{{display:block}}.top-actions{{margin-top:18px}}.side-nav-links{{grid-template-columns:repeat(2,1fr)}}}}
 @media(max-width:520px){{.stats{{grid-template-columns:1fr}}h1{{font-size:30px}}.search{{min-width:100%;width:100%}}.control-group{{width:100%}}.calendar-panel{{padding:14px}}.calendar-header{{align-items:flex-start}}.calendar-month{{font-size:20px}}.calendar-day{{min-height:54px;padding:7px}}.calendar-count{{display:none}}}}
 </style>
