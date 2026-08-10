@@ -2735,7 +2735,7 @@ tr.warning{{background:#fffaf0}}tr.critical{{background:#fff1f1}}tr.warning td:f
 </head>
 <body><main class="wrap">
 <div class="topbar"><div><div class="brand">FICO CONTROL</div><h1>Control ore șoferi</h1><div class="subtitle">Verificare zilnică după Anmelden și Abmelden · limita maximă 10h 30m</div></div>
-<div class="actions"><a class="btn btn-light" href="/admin">FICO Dashboard</a><a class="btn btn-light" href="/admin/mentor">Mentor Check</a><a class="btn btn-light" href="/admin/pod-ccc">POD & CCC</a><a class="btn btn-light" href="/admin/owner">Owner</a></div></div>
+<div class="actions"><a class="btn btn-light" href="/admin">FICO Dashboard</a><a class="btn btn-light" href="/admin/mentor">Mentor Check</a><a class="btn btn-light" href="/admin/pod-ccc">POD & CCC</a><a class="btn btn-light" href="/admin/concessions">Concesii</a><a class="btn btn-light" href="/admin/owner">Owner</a></div></div>
 {error_html}
 <section class="hero"><div><h2>Încarcă raportul săptămânal Amazon</h2><p>Este detectat automat „Service Details Report”. Dublurile identice și intervalele suprapuse nu sunt adunate de două ori.</p></div>
 <form class="upload" method="post" action="/admin/hours" enctype="multipart/form-data"><input type="file" name="report_file" accept=".zip,.csv" required><button class="btn btn-dark" type="submit">Verifică orele</button></form></section>
@@ -2974,7 +2974,7 @@ def pod_ccc_html(processed=None, error=""):
         result_html = f'<section class="pc-results"><div class="pc-stats">{"".join(cards)}</div><div class="pc-downloads">{"".join(downloads)}</div>{unmapped_html}<div class="pc-table"><table><thead><tr><th>Raport</th><th>Șofer</th><th>Cazuri</th><th>Status</th></tr></thead><tbody>{"".join(driver_rows)}</tbody></table></div></section>'
     return f'''<!doctype html><html lang="ro"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>POD & CCC · FICO Control</title>
 <style>*{{box-sizing:border-box}}body{{margin:0;background:#f4f6f8;color:#17212b;font-family:Arial,sans-serif}}.pc-wrap{{width:min(96%,1180px);margin:28px auto 60px}}.pc-top{{display:flex;justify-content:space-between;gap:20px;align-items:flex-start}}.pc-brand{{font-size:12px;font-weight:900;letter-spacing:2px}}h1{{font-size:38px;margin:9px 0 5px}}.pc-sub{{color:#667085}}.pc-actions{{display:flex;gap:8px;flex-wrap:wrap}}.pc-btn{{display:inline-flex;text-decoration:none;border:1px solid #d8dde3;border-radius:10px;padding:12px 15px;background:#fff;color:#17212b;font-weight:800;cursor:pointer}}.pc-primary{{background:#17212b;color:#fff;border-color:#17212b}}.pc-hero{{margin-top:22px;background:linear-gradient(120deg,#0d4f6b,#177e9c);color:#fff;border-radius:18px;padding:26px}}.pc-hero h2{{margin:0 0 8px}}.pc-hero p{{color:#d5edf3;margin:0 0 20px}}.pc-form{{display:grid;grid-template-columns:repeat(3,1fr) auto;gap:12px;align-items:end}}.pc-upload{{background:#fff;color:#17212b;border-radius:12px;padding:12px}}.pc-upload label{{display:block;font-size:12px;font-weight:900;margin-bottom:7px}}.pc-upload input{{max-width:100%}}.pc-error,.pc-warning{{margin-top:16px;padding:14px 16px;background:#fff0f0;border-left:4px solid #d92d20;color:#9f2f27}}.pc-results{{margin-top:18px}}.pc-stats{{display:grid;grid-template-columns:repeat(2,1fr);gap:14px}}.pc-stat{{background:#fff;border:1px solid #e4e7ec;border-radius:15px;padding:18px;display:grid;grid-template-columns:1fr auto}}.pc-stat span{{font-weight:900}}.pc-stat strong{{font-size:34px;grid-row:1/3;grid-column:2}}.pc-stat small{{color:#667085;margin-top:6px}}.pc-downloads{{display:flex;gap:10px;margin:15px 0}}.pc-table{{background:#fff;border:1px solid #e4e7ec;border-radius:15px;overflow:hidden}}table{{width:100%;border-collapse:collapse}}th,td{{padding:13px 15px;text-align:left;border-bottom:1px solid #edf0f2}}th{{font-size:11px;color:#667085;background:#fafafa;text-transform:uppercase}}td small{{display:block;color:#98a2b3;margin-top:3px}}tr.danger{{background:#fff0f0}}tr.danger td:first-child{{border-left:4px solid #d92d20}}tr.single{{background:#fffaf0}}@media(max-width:850px){{.pc-top{{display:block}}.pc-actions{{margin-top:14px}}.pc-form{{grid-template-columns:1fr}}.pc-stats{{grid-template-columns:1fr}}}}</style></head>
-<body><main class="pc-wrap"><div class="pc-top"><div><div class="pc-brand">FICO CONTROL</div><h1>POD & CCC</h1><div class="pc-sub">Înlocuire automată Transporter ID cu numele real și rapoarte profesionale</div></div><div class="pc-actions"><a class="pc-btn" href="/admin">FICO Dashboard</a><a class="pc-btn" href="/admin/hours">Control ore</a></div></div>{error_html}<section class="pc-hero"><h2>Încarcă cele trei fișiere Amazon</h2><p>Planul săptămânal furnizează numele reale. POD și CCC sunt procesate separat.</p><form class="pc-form" method="post" action="/admin/pod-ccc" enctype="multipart/form-data"><div class="pc-upload"><label>1. Plan săptămânal ID–nume</label><input type="file" name="mapping_file" accept=".xlsx" required></div><div class="pc-upload"><label>2. Raport POD</label><input type="file" name="pod_file" accept=".csv" required></div><div class="pc-upload"><label>3. Raport CCC</label><input type="file" name="ccc_file" accept=".csv" required></div><button class="pc-btn pc-primary" type="submit">Generează rapoartele</button></form></section>{result_html}</main></body></html>'''
+<body><main class="pc-wrap"><div class="pc-top"><div><div class="pc-brand">FICO CONTROL</div><h1>POD & CCC</h1><div class="pc-sub">Înlocuire automată Transporter ID cu numele real și rapoarte profesionale</div></div><div class="pc-actions"><a class="pc-btn" href="/admin">FICO Dashboard</a><a class="pc-btn" href="/admin/hours">Control ore</a><a class="pc-btn" href="/admin/concessions">Concesii</a></div></div>{error_html}<section class="pc-hero"><h2>Încarcă cele trei fișiere Amazon</h2><p>Planul săptămânal furnizează numele reale. POD și CCC sunt procesate separat.</p><form class="pc-form" method="post" action="/admin/pod-ccc" enctype="multipart/form-data"><div class="pc-upload"><label>1. Plan săptămânal ID–nume</label><input type="file" name="mapping_file" accept=".xlsx" required></div><div class="pc-upload"><label>2. Raport POD</label><input type="file" name="pod_file" accept=".csv" required></div><div class="pc-upload"><label>3. Raport CCC</label><input type="file" name="ccc_file" accept=".csv" required></div><button class="pc-btn pc-primary" type="submit">Generează rapoartele</button></form></section>{result_html}</main></body></html>'''
 
 
 @app.get("/admin/pod-ccc", response_class=HTMLResponse)
@@ -3025,6 +3025,180 @@ async def pod_ccc_upload(
     finally:
         for upload in files:
             await upload.close()
+
+
+CONCESSIONS_DNR_COLUMN = "Pakete, die geliefert aber nicht empfangen wurden (DNR)"
+
+
+def parse_integer_metric(value):
+    clean = re.sub(r"[^0-9-]", "", str(value or ""))
+    return int(clean) if clean not in {"", "-"} else 0
+
+
+def parse_concessions_csv(csv_bytes: bytes):
+    decoded = None
+    for encoding in ("utf-8-sig", "utf-8", "cp1252"):
+        try:
+            decoded = csv_bytes.decode(encoding)
+            break
+        except UnicodeDecodeError:
+            continue
+    if decoded is None:
+        raise ValueError("Fișierul de concesii nu poate fi citit.")
+    try:
+        dialect = csv.Sniffer().sniff(decoded[:4096], delimiters=",;\t")
+    except csv.Error:
+        dialect = csv.excel
+    reader = csv.DictReader(io.StringIO(decoded), dialect=dialect)
+    required = {"Woche", "Name des Zustellenden", CONCESSIONS_DNR_COLUMN}
+    if not reader.fieldnames or not required.issubset(set(reader.fieldnames)):
+        raise ValueError("Raportul nu conține coloanele necesare pentru concesii.")
+    parsed = []
+    week_value = ""
+    for source_index, row in enumerate(reader):
+        week_value = week_value or str(row.get("Woche") or "").strip()
+        driver_name = clean_driver_display_name(row.get("Name des Zustellenden"))
+        dnr_count = parse_integer_metric(row.get(CONCESSIONS_DNR_COLUMN))
+        dnr_dpmo = parse_integer_metric(row.get("DNR DPMO"))
+        if driver_name and dnr_count > 0:
+            parsed.append({
+                "name": driver_name,
+                "count": dnr_count,
+                "dpmo": dnr_dpmo,
+                "source_index": source_index
+            })
+    if not parsed:
+        raise ValueError("Raportul nu conține nicio concesie DNR.")
+    parsed.sort(key=lambda item: (-item["count"], item["dpmo"], item["source_index"]))
+    match = re.search(r"(20\d{2})\D+(\d{1,2})", week_value)
+    if not match:
+        raise ValueError("Nu am putut identifica săptămâna raportului.")
+    return parsed, int(match.group(1)), int(match.group(2))
+
+
+def concessions_week_label(year, week):
+    monday = date.fromisocalendar(year, week, 1)
+    start = monday - timedelta(days=1)
+    end = start + timedelta(days=6)
+    months = ["Jan.", "Feb.", "Mar.", "Apr.", "May", "Jun.", "Jul.", "Aug.", "Sep.", "Oct.", "Nov.", "Dec."]
+    if start.month == end.month:
+        period = f"{months[start.month - 1]} {start.day}-{months[end.month - 1]} {end.day}"
+        filename_period = f"{months[start.month - 1].replace('.', '')}{start.day}-{months[end.month - 1].replace('.', '')}{end.day}"
+    else:
+        period = f"{months[start.month - 1]} {start.day}-{months[end.month - 1]} {end.day}"
+        filename_period = f"{months[start.month - 1].replace('.', '')}{start.day}-{months[end.month - 1].replace('.', '')}{end.day}"
+    return period, filename_period
+
+
+def build_concessions_workbook(rows, year, week):
+    workbook = openpyxl.Workbook()
+    sheet = workbook.active
+    sheet.title = f"KW{week}"
+    sheet.sheet_view.showGridLines = False
+    period, _ = concessions_week_label(year, week)
+    headers = ["NR.", "Fahrer name", f"Woche {week}, {period}"]
+    cyan = "22B5E5"
+    red = "FF0000"
+    gold = "D6A900"
+    yellow = "FFDB6E"
+    white = "FFFFFF"
+    black = "000000"
+    grid = openpyxl.styles.Side(style="thin", color="A0A0A0")
+    outer = openpyxl.styles.Side(style="thin", color="777777")
+    border = openpyxl.styles.Border(left=outer, right=outer, top=grid, bottom=grid)
+
+    for col, header in enumerate(headers, start=1):
+        cell = sheet.cell(1, col, header)
+        cell.font = openpyxl.styles.Font(name="Carlito", size=11, bold=True, color=black)
+        cell.fill = openpyxl.styles.PatternFill("solid", fgColor=cyan)
+        cell.alignment = openpyxl.styles.Alignment(horizontal="center", vertical="center")
+        cell.border = border
+    sheet.row_dimensions[1].height = 27
+
+    for row_number, item in enumerate(rows, start=2):
+        rank = row_number - 1
+        count = item["count"]
+        values = [rank, item["name"], count]
+        for col, value in enumerate(values, start=1):
+            cell = sheet.cell(row_number, col, value)
+            cell.font = openpyxl.styles.Font(name="Carlito", size=11, color=black)
+            cell.alignment = openpyxl.styles.Alignment(
+                horizontal="center" if col != 2 else "left",
+                vertical="center"
+            )
+            cell.border = border
+        if count >= 2:
+            sheet.cell(row_number, 2).fill = openpyxl.styles.PatternFill("solid", fgColor=red)
+            sheet.cell(row_number, 2).font = openpyxl.styles.Font(name="Carlito", size=11, bold=True, color=white)
+            sheet.cell(row_number, 3).font = openpyxl.styles.Font(name="Carlito", size=11, bold=True, color=red)
+        else:
+            sheet.cell(row_number, 2).fill = openpyxl.styles.PatternFill("solid", fgColor=yellow)
+            sheet.cell(row_number, 2).font = openpyxl.styles.Font(name="Carlito", size=11, bold=True, color=gold)
+            sheet.cell(row_number, 3).font = openpyxl.styles.Font(name="Carlito", size=11, bold=True, color=gold)
+        sheet.row_dimensions[row_number].height = 22
+
+    total_row = len(rows) + 2
+    sheet.cell(total_row, 1, "")
+    sheet.cell(total_row, 2, "TOTAL")
+    sheet.cell(total_row, 3, sum(item["count"] for item in rows))
+    for col in range(1, 4):
+        cell = sheet.cell(total_row, col)
+        cell.fill = openpyxl.styles.PatternFill("solid", fgColor=cyan)
+        cell.font = openpyxl.styles.Font(name="Carlito", size=11, bold=True, color=black)
+        cell.alignment = openpyxl.styles.Alignment(horizontal="center", vertical="center")
+        cell.border = border
+    sheet.row_dimensions[total_row].height = 25
+    sheet.column_dimensions["A"].width = 10
+    sheet.column_dimensions["B"].width = 36
+    sheet.column_dimensions["C"].width = 24
+    sheet.freeze_panes = "A2"
+    sheet.auto_filter.ref = f"A1:C{len(rows) + 1}"
+    sheet.page_setup.orientation = "portrait"
+    sheet.page_setup.fitToWidth = 1
+    sheet.sheet_properties.pageSetUpPr.fitToPage = True
+    output = io.BytesIO()
+    workbook.save(output)
+    workbook.close()
+    return output.getvalue()
+
+
+def concessions_html(result=None, error=""):
+    result = result or {}
+    error_html = f'<div class="cn-error"><strong>Eroare:</strong> {html.escape(error)}</div>' if error else ""
+    result_html = ""
+    if result:
+        result_html = f'''<section class="cn-result"><div><span>Total concesii DNR</span><strong>{result["total"]}</strong><small>{result["drivers"]} șoferi · KW {result["week"]}</small></div><a class="cn-btn cn-primary" download="{html.escape(result["filename"])}" href="data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,{result["xlsx"]}">Descarcă Excel Concesii</a></section>'''
+    return f'''<!doctype html><html lang="ro"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Concesii · FICO Control</title><style>*{{box-sizing:border-box}}body{{margin:0;background:#f4f6f8;color:#17212b;font-family:Arial,sans-serif}}.cn-wrap{{width:min(96%,1050px);margin:28px auto 60px}}.cn-top{{display:flex;justify-content:space-between;gap:18px;align-items:flex-start}}.cn-brand{{font-size:12px;font-weight:900;letter-spacing:2px}}h1{{font-size:38px;margin:9px 0 5px}}.cn-sub{{color:#667085}}.cn-actions{{display:flex;gap:8px;flex-wrap:wrap}}.cn-btn{{display:inline-flex;text-decoration:none;border:1px solid #d8dde3;border-radius:10px;padding:12px 15px;background:#fff;color:#17212b;font-weight:800;cursor:pointer}}.cn-primary{{background:#17212b;color:#fff;border-color:#17212b}}.cn-hero{{margin-top:22px;background:linear-gradient(120deg,#0d4f6b,#177e9c);color:#fff;border-radius:18px;padding:28px}}.cn-hero h2{{margin:0 0 8px}}.cn-hero p{{color:#d5edf3;margin:0 0 20px}}.cn-form{{display:flex;gap:12px;align-items:center;flex-wrap:wrap;background:#fff;padding:13px;border-radius:12px}}.cn-form input{{color:#17212b;flex:1;min-width:250px}}.cn-error{{margin-top:16px;padding:14px 16px;background:#fff0f0;border-left:4px solid #d92d20;color:#9f2f27}}.cn-result{{margin-top:18px;background:#fff;border:1px solid #e4e7ec;border-radius:16px;padding:20px;display:flex;justify-content:space-between;align-items:center;gap:18px}}.cn-result div{{display:grid;grid-template-columns:1fr auto}}.cn-result span{{font-weight:900}}.cn-result strong{{font-size:36px;grid-row:1/3;grid-column:2;margin-left:28px}}.cn-result small{{color:#667085;margin-top:6px}}@media(max-width:700px){{.cn-top,.cn-result{{display:block}}.cn-actions{{margin-top:14px}}.cn-result .cn-btn{{margin-top:15px}}}}</style></head><body><main class="cn-wrap"><div class="cn-top"><div><div class="cn-brand">FICO CONTROL</div><h1>Concesii</h1><div class="cn-sub">Raport săptămânal DNR ordonat și formatat automat</div></div><div class="cn-actions"><a class="cn-btn" href="/admin">FICO Dashboard</a><a class="cn-btn" href="/admin/pod-ccc">POD & CCC</a></div></div>{error_html}<section class="cn-hero"><h2>Încarcă raportul Amazon Concessions</h2><p>Șoferii cu cele mai multe concesii apar primii. Raportul final respectă modelul KW.</p><form class="cn-form" method="post" action="/admin/concessions" enctype="multipart/form-data"><input type="file" name="concessions_file" accept=".csv" required><button class="cn-btn cn-primary" type="submit">Generează Excel</button></form></section>{result_html}</main></body></html>'''
+
+
+@app.get("/admin/concessions", response_class=HTMLResponse)
+def concessions_page():
+    return HTMLResponse(concessions_html())
+
+
+@app.post("/admin/concessions", response_class=HTMLResponse)
+async def concessions_upload(concessions_file: UploadFile = File(...)):
+    try:
+        if not (concessions_file.filename or "").lower().endswith(".csv"):
+            raise ValueError("Raportul de concesii trebuie să fie un fișier CSV.")
+        raw = await concessions_file.read(POD_CCC_MAX_FILE_BYTES + 1)
+        if len(raw) > POD_CCC_MAX_FILE_BYTES:
+            raise ValueError("Fișierul depășește limita de 12 MB.")
+        rows, year, week = parse_concessions_csv(raw)
+        workbook_bytes = build_concessions_workbook(rows, year, week)
+        _, filename_period = concessions_week_label(year, week)
+        result = {
+            "total": sum(item["count"] for item in rows),
+            "drivers": len(rows),
+            "week": week,
+            "filename": f"KW{week}_Concessions_{filename_period}.xlsx",
+            "xlsx": base64.b64encode(workbook_bytes).decode("ascii")
+        }
+        return HTMLResponse(concessions_html(result))
+    except ValueError as exc:
+        return HTMLResponse(concessions_html(error=str(exc)), status_code=400)
+    finally:
+        await concessions_file.close()
 
 
 @app.get("/admin/mentor", response_class=HTMLResponse)
@@ -3169,6 +3343,7 @@ th{{font-size:12px;color:#667085;background:#fafafa}}
       <a class="btn btn-light" href="/admin?d={selected}">FICO Dashboard</a>
       <a class="btn btn-light" href="/admin/hours">Control ore</a>
       <a class="btn btn-light" href="/admin/pod-ccc">POD & CCC</a>
+      <a class="btn btn-light" href="/admin/concessions">Concesii</a>
       <a class="btn btn-light" href="/admin/owner">Owner</a>
       <button class="btn btn-dark" type="button" onclick="copyMissing()">Copiază șoferii lipsă</button>
     </div>
@@ -4188,6 +4363,7 @@ th{{font-size:13px;color:#667085;text-transform:uppercase;letter-spacing:.4px}}
         <a class="btn-light" href="/admin/mentor?d={selected}">Mentor Check</a>
         <a class="btn-light" href="/admin/hours">Control ore</a>
         <a class="btn-light" href="/admin/pod-ccc">POD & CCC</a>
+        <a class="btn-light" href="/admin/concessions">Concesii</a>
         <a class="btn-light" href="/admin/owner">Owner</a>
         <form method="post" action="/admin/logout" style="margin:0">
             <button class="btn-light" type="submit">Ieșire</button>
