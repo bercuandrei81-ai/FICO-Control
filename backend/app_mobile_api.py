@@ -4269,7 +4269,7 @@ def admin_page(request: Request, d: str | None = None, q: str | None = None):
 body{{margin:0;font-family:Arial,Helvetica,sans-serif;background:#f4f6f8;color:#17212b}}
 .app-shell{{width:min(97%,1540px);margin:28px auto 60px;display:grid;grid-template-columns:210px minmax(0,1fr);gap:24px;align-items:start}}
 .admin{{width:100%;min-width:0;margin:0}}
-.side-nav{{position:sticky;top:22px;background:#17212b;color:#fff;border-radius:18px;padding:18px;box-shadow:0 7px 22px rgba(23,33,43,.16)}}
+.side-nav{{position:sticky;top:22px;z-index:2;background:#17212b;color:#fff;border-radius:18px;padding:18px;box-shadow:0 7px 22px rgba(23,33,43,.16)}}
 .side-brand{{font-size:11px;font-weight:900;letter-spacing:1.8px;color:#aeb8c4;margin:3px 4px 16px}}
 .side-nav-links{{display:flex;flex-direction:column;gap:9px}}
 .side-link{{display:flex;align-items:center;gap:10px;color:#fff;text-decoration:none;padding:13px 12px;border-radius:10px;font-size:14px;font-weight:800;border:1px solid rgba(255,255,255,.13);background:rgba(255,255,255,.055)}}
