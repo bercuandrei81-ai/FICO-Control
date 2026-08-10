@@ -2735,7 +2735,7 @@ tr.warning{{background:#fffaf0}}tr.critical{{background:#fff1f1}}tr.warning td:f
 </head>
 <body><main class="wrap">
 <div class="topbar"><div><div class="brand">FICO CONTROL</div><h1>Control ore șoferi</h1><div class="subtitle">Verificare zilnică după Anmelden și Abmelden · limita maximă 10h 30m</div></div>
-<div class="actions"><a class="btn btn-light" href="/admin">FICO Dashboard</a><a class="btn btn-light" href="/admin/mentor">Mentor Check</a><a class="btn btn-light" href="/admin/owner">Owner</a></div></div>
+<div class="actions"><a class="btn btn-light" href="/admin">FICO Dashboard</a><a class="btn btn-light" href="/admin/mentor">Mentor Check</a><a class="btn btn-light" href="/admin/pod-ccc">POD & CCC</a><a class="btn btn-light" href="/admin/owner">Owner</a></div></div>
 {error_html}
 <section class="hero"><div><h2>Încarcă raportul săptămânal Amazon</h2><p>Este detectat automat „Service Details Report”. Dublurile identice și intervalele suprapuse nu sunt adunate de două ori.</p></div>
 <form class="upload" method="post" action="/admin/hours" enctype="multipart/form-data"><input type="file" name="report_file" accept=".zip,.csv" required><button class="btn btn-dark" type="submit">Verifică orele</button></form></section>
@@ -2781,6 +2781,284 @@ async def hours_control_upload(report_file: UploadFile = File(...)):
         )
     finally:
         await report_file.close()
+
+
+POD_CCC_MAX_FILE_BYTES = 12 * 1024 * 1024
+
+
+def clean_driver_display_name(value):
+    name = re.sub(r"\s+", " ", str(value or "")).strip()
+    return name.split("•", 1)[0].strip()
+
+
+def extract_transporter_mapping(xlsx_bytes: bytes):
+    workbook = openpyxl.load_workbook(
+        io.BytesIO(xlsx_bytes), read_only=True, data_only=True
+    )
+    mapping = {}
+    try:
+        for sheet in workbook.worksheets:
+            header_row = None
+            name_col = None
+            id_col = None
+            for row_number, row in enumerate(
+                sheet.iter_rows(min_row=1, max_row=min(sheet.max_row, 25), values_only=True),
+                start=1
+            ):
+                headers = [re.sub(r"\s+", " ", str(value or "")).strip().casefold() for value in row]
+                for index, header in enumerate(headers):
+                    if header in {"name des mitarbeiters", "driver name", "name"}:
+                        name_col = index
+                    if header in {"transporter-id", "transporter id", "associate id"}:
+                        id_col = index
+                if name_col is not None and id_col is not None:
+                    header_row = row_number
+                    break
+            if header_row is None:
+                continue
+            for row in sheet.iter_rows(min_row=header_row + 1, values_only=True):
+                if name_col >= len(row) or id_col >= len(row):
+                    continue
+                driver_id = re.sub(r"\s+", "", str(row[id_col] or "")).upper()
+                driver_name = clean_driver_display_name(row[name_col])
+                if driver_id and driver_name and "GESAMT" not in driver_id:
+                    mapping[driver_id] = driver_name
+            if mapping:
+                break
+    finally:
+        workbook.close()
+    if not mapping:
+        raise ValueError("Nu am găsit coloanele Name des Mitarbeiters și Transporter-ID în plan.")
+    return mapping
+
+
+def decode_amazon_csv(csv_bytes: bytes):
+    decoded = None
+    for encoding in ("utf-8-sig", "utf-8", "cp1252"):
+        try:
+            decoded = csv_bytes.decode(encoding)
+            break
+        except UnicodeDecodeError:
+            continue
+    if decoded is None:
+        raise ValueError("Fișierul CSV nu poate fi citit.")
+    try:
+        dialect = csv.Sniffer().sniff(decoded[:4096], delimiters=",;\t")
+    except csv.Error:
+        dialect = csv.excel
+    reader = csv.DictReader(io.StringIO(decoded), dialect=dialect)
+    rows = list(reader)
+    if not reader.fieldnames or "Transporter ID" not in reader.fieldnames:
+        raise ValueError("Raportul nu conține coloana Transporter ID.")
+    return rows, reader.fieldnames
+
+
+def parse_report_date(filename: str):
+    match = re.search(r"(20\d{2})[-_](\d{2})[-_](\d{2})", filename or "")
+    return "-".join(match.groups()) if match else date.today().isoformat()
+
+
+def group_quality_issues(rows, mapping, report_kind):
+    expected = "POD Audit" if report_kind == "POD" else "Call Duration (Seconds)"
+    if rows and expected not in rows[0]:
+        raise ValueError(f"Fișierul selectat nu pare să fie raport {report_kind}.")
+    groups = {}
+    unmapped_ids = set()
+    for row in rows:
+        driver_id = re.sub(r"\s+", "", str(row.get("Transporter ID") or "")).upper()
+        if not driver_id:
+            continue
+        driver_name = mapping.get(driver_id)
+        if not driver_name:
+            driver_name = f"ID necunoscut: {driver_id}"
+            unmapped_ids.add(driver_id)
+        group = groups.setdefault(driver_id, {
+            "id": driver_id,
+            "name": driver_name,
+            "items": []
+        })
+        group["items"].append({key: str(value or "").replace("<br/>", " / ").strip() for key, value in row.items()})
+    ordered = sorted(groups.values(), key=lambda group: (-len(group["items"]), group["name"].casefold()))
+    return ordered, sorted(unmapped_ids)
+
+
+def build_quality_workbook(report_kind, report_date, groups):
+    workbook = openpyxl.Workbook()
+    sheet = workbook.active
+    sheet.title = report_kind
+    sheet.sheet_view.showGridLines = False
+    if report_kind == "POD":
+        headers = ["Nr.", "Tracking ID", "Delivery / Attempt Reason", "POD Audit"]
+        detail_keys = ["Tracking ID", "Delivery/Attempt Reason", "POD Audit"]
+        widths = [8, 22, 42, 34]
+    else:
+        headers = ["Nr.", "Tracking ID", "Delivery / Attempt Reason", "CC Type", "Call Duration (sec.)"]
+        detail_keys = ["Tracking ID", "Delivery/Attempt Reason", "CC Type", "Call Duration (Seconds)"]
+        widths = [8, 22, 48, 24, 22]
+    last_col = len(headers)
+    dark = "17212B"
+    red = "D92D20"
+    red_light = "FDE8E7"
+    yellow = "F4B740"
+    yellow_light = "FFF5D6"
+    blue = "0E7490"
+    white = "FFFFFF"
+    muted = "667085"
+    thin = openpyxl.styles.Side(style="thin", color="DDE2E7")
+
+    sheet.merge_cells(start_row=1, start_column=1, end_row=1, end_column=last_col)
+    title = sheet.cell(1, 1, f"MR LOGISTICS · RAPORT {report_kind}")
+    title.font = openpyxl.styles.Font(name="Arial", size=18, bold=True, color=white)
+    title.fill = openpyxl.styles.PatternFill("solid", fgColor=dark)
+    title.alignment = openpyxl.styles.Alignment(vertical="center")
+    sheet.row_dimensions[1].height = 36
+    sheet.merge_cells(start_row=2, start_column=1, end_row=2, end_column=last_col)
+    subtitle = sheet.cell(2, 1, f"Data raportului: {report_date[8:10]}.{report_date[5:7]}.{report_date[:4]}  ·  Șoferii cu cele mai multe cazuri sunt afișați primii")
+    subtitle.font = openpyxl.styles.Font(name="Arial", size=10, color=muted)
+    subtitle.alignment = openpyxl.styles.Alignment(vertical="center")
+    sheet.row_dimensions[2].height = 24
+
+    total_cases = sum(len(group["items"]) for group in groups)
+    high_risk = sum(1 for group in groups if len(group["items"]) >= 2)
+    cards = [("TOTAL CAZURI", total_cases), ("ȘOFERI", len(groups)), ("ATENȚIE 2+", high_risk)]
+    for index, (label, value) in enumerate(cards):
+        col = 1 + index
+        cell = sheet.cell(4, col, f"{label}\n{value}")
+        cell.font = openpyxl.styles.Font(name="Arial", size=11, bold=True, color=white)
+        cell.fill = openpyxl.styles.PatternFill("solid", fgColor=blue if index < 2 else red)
+        cell.alignment = openpyxl.styles.Alignment(horizontal="center", vertical="center", wrap_text=True)
+    if last_col > 3:
+        sheet.merge_cells(start_row=4, start_column=3, end_row=4, end_column=last_col)
+    sheet.row_dimensions[4].height = 46
+
+    current_row = 6
+    sections = [
+        ("ATENȚIE · 2 SAU MAI MULTE CAZURI", [group for group in groups if len(group["items"]) >= 2], red),
+        ("UN SINGUR CAZ", [group for group in groups if len(group["items"]) == 1], yellow),
+    ]
+    driver_number = 1
+    for section_title, section_groups, color in sections:
+        if not section_groups:
+            continue
+        sheet.merge_cells(start_row=current_row, start_column=1, end_row=current_row, end_column=last_col)
+        section_cell = sheet.cell(current_row, 1, section_title)
+        section_cell.font = openpyxl.styles.Font(name="Arial", size=11, bold=True, color=white if color == red else dark)
+        section_cell.fill = openpyxl.styles.PatternFill("solid", fgColor=color)
+        section_cell.alignment = openpyxl.styles.Alignment(vertical="center")
+        sheet.row_dimensions[current_row].height = 25
+        current_row += 1
+        for group in section_groups:
+            count = len(group["items"])
+            fill = red_light if count >= 2 else yellow_light
+            sheet.merge_cells(start_row=current_row, start_column=1, end_row=current_row, end_column=last_col)
+            driver_cell = sheet.cell(current_row, 1, f"{driver_number}. {group['name']}  ·  {count} {'cazuri' if count != 1 else 'caz'}")
+            driver_cell.font = openpyxl.styles.Font(name="Arial", size=12, bold=True, color=dark)
+            driver_cell.fill = openpyxl.styles.PatternFill("solid", fgColor=fill)
+            driver_cell.alignment = openpyxl.styles.Alignment(vertical="center")
+            sheet.row_dimensions[current_row].height = 27
+            current_row += 1
+            for col, header in enumerate(headers, start=1):
+                cell = sheet.cell(current_row, col, header)
+                cell.font = openpyxl.styles.Font(name="Arial", size=9, bold=True, color=white)
+                cell.fill = openpyxl.styles.PatternFill("solid", fgColor=dark)
+                cell.alignment = openpyxl.styles.Alignment(vertical="center")
+            current_row += 1
+            for item_number, item in enumerate(group["items"], start=1):
+                values = [item_number] + [item.get(key, "") for key in detail_keys]
+                for col, value in enumerate(values, start=1):
+                    cell = sheet.cell(current_row, col, value)
+                    cell.font = openpyxl.styles.Font(name="Arial", size=10, color=dark)
+                    cell.alignment = openpyxl.styles.Alignment(vertical="top", wrap_text=True)
+                    cell.border = openpyxl.styles.Border(bottom=thin)
+                    if col == 1:
+                        cell.alignment = openpyxl.styles.Alignment(horizontal="center", vertical="top")
+                sheet.row_dimensions[current_row].height = 31
+                current_row += 1
+            current_row += 1
+            driver_number += 1
+    for column, width in enumerate(widths, start=1):
+        sheet.column_dimensions[openpyxl.utils.get_column_letter(column)].width = width
+    sheet.freeze_panes = "A6"
+    sheet.auto_filter.ref = f"A6:{openpyxl.utils.get_column_letter(last_col)}{max(6, current_row - 1)}"
+    output = io.BytesIO()
+    workbook.save(output)
+    workbook.close()
+    return output.getvalue()
+
+
+def pod_ccc_html(processed=None, error=""):
+    processed = processed or {}
+    error_html = f'<div class="pc-error"><strong>Eroare:</strong> {html.escape(error)}</div>' if error else ""
+    result_html = ""
+    if processed:
+        cards = []
+        downloads = []
+        driver_rows = []
+        for kind in ("POD", "CCC"):
+            info = processed[kind]
+            cases = sum(len(group["items"]) for group in info["groups"])
+            alert = sum(1 for group in info["groups"] if len(group["items"]) >= 2)
+            cards.append(f'<div class="pc-stat"><span>{kind}</span><strong>{cases}</strong><small>{len(info["groups"])} șoferi · {alert} cu 2+ cazuri</small></div>')
+            downloads.append(f'<a class="pc-btn pc-primary" download="{kind}_{info["date"]}.xlsx" href="data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,{info["xlsx"]}">Descarcă Excel {kind}</a>')
+            for group in info["groups"]:
+                count = len(group["items"])
+                driver_rows.append(f'<tr class="{"danger" if count >= 2 else "single"}"><td>{kind}</td><td><strong>{html.escape(group["name"])}</strong><small>{html.escape(group["id"])}</small></td><td>{count}</td><td>{"ATENȚIE" if count >= 2 else "1 caz"}</td></tr>')
+        unmapped = sorted(set(processed["POD"]["unmapped"] + processed["CCC"]["unmapped"]))
+        unmapped_html = f'<div class="pc-warning">ID-uri fără nume: {html.escape(", ".join(unmapped))}</div>' if unmapped else ""
+        result_html = f'<section class="pc-results"><div class="pc-stats">{"".join(cards)}</div><div class="pc-downloads">{"".join(downloads)}</div>{unmapped_html}<div class="pc-table"><table><thead><tr><th>Raport</th><th>Șofer</th><th>Cazuri</th><th>Status</th></tr></thead><tbody>{"".join(driver_rows)}</tbody></table></div></section>'
+    return f'''<!doctype html><html lang="ro"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>POD & CCC · FICO Control</title>
+<style>*{{box-sizing:border-box}}body{{margin:0;background:#f4f6f8;color:#17212b;font-family:Arial,sans-serif}}.pc-wrap{{width:min(96%,1180px);margin:28px auto 60px}}.pc-top{{display:flex;justify-content:space-between;gap:20px;align-items:flex-start}}.pc-brand{{font-size:12px;font-weight:900;letter-spacing:2px}}h1{{font-size:38px;margin:9px 0 5px}}.pc-sub{{color:#667085}}.pc-actions{{display:flex;gap:8px;flex-wrap:wrap}}.pc-btn{{display:inline-flex;text-decoration:none;border:1px solid #d8dde3;border-radius:10px;padding:12px 15px;background:#fff;color:#17212b;font-weight:800;cursor:pointer}}.pc-primary{{background:#17212b;color:#fff;border-color:#17212b}}.pc-hero{{margin-top:22px;background:linear-gradient(120deg,#0d4f6b,#177e9c);color:#fff;border-radius:18px;padding:26px}}.pc-hero h2{{margin:0 0 8px}}.pc-hero p{{color:#d5edf3;margin:0 0 20px}}.pc-form{{display:grid;grid-template-columns:repeat(3,1fr) auto;gap:12px;align-items:end}}.pc-upload{{background:#fff;color:#17212b;border-radius:12px;padding:12px}}.pc-upload label{{display:block;font-size:12px;font-weight:900;margin-bottom:7px}}.pc-upload input{{max-width:100%}}.pc-error,.pc-warning{{margin-top:16px;padding:14px 16px;background:#fff0f0;border-left:4px solid #d92d20;color:#9f2f27}}.pc-results{{margin-top:18px}}.pc-stats{{display:grid;grid-template-columns:repeat(2,1fr);gap:14px}}.pc-stat{{background:#fff;border:1px solid #e4e7ec;border-radius:15px;padding:18px;display:grid;grid-template-columns:1fr auto}}.pc-stat span{{font-weight:900}}.pc-stat strong{{font-size:34px;grid-row:1/3;grid-column:2}}.pc-stat small{{color:#667085;margin-top:6px}}.pc-downloads{{display:flex;gap:10px;margin:15px 0}}.pc-table{{background:#fff;border:1px solid #e4e7ec;border-radius:15px;overflow:hidden}}table{{width:100%;border-collapse:collapse}}th,td{{padding:13px 15px;text-align:left;border-bottom:1px solid #edf0f2}}th{{font-size:11px;color:#667085;background:#fafafa;text-transform:uppercase}}td small{{display:block;color:#98a2b3;margin-top:3px}}tr.danger{{background:#fff0f0}}tr.danger td:first-child{{border-left:4px solid #d92d20}}tr.single{{background:#fffaf0}}@media(max-width:850px){{.pc-top{{display:block}}.pc-actions{{margin-top:14px}}.pc-form{{grid-template-columns:1fr}}.pc-stats{{grid-template-columns:1fr}}}}</style></head>
+<body><main class="pc-wrap"><div class="pc-top"><div><div class="pc-brand">FICO CONTROL</div><h1>POD & CCC</h1><div class="pc-sub">Înlocuire automată Transporter ID cu numele real și rapoarte profesionale</div></div><div class="pc-actions"><a class="pc-btn" href="/admin">FICO Dashboard</a><a class="pc-btn" href="/admin/hours">Control ore</a></div></div>{error_html}<section class="pc-hero"><h2>Încarcă cele trei fișiere Amazon</h2><p>Planul săptămânal furnizează numele reale. POD și CCC sunt procesate separat.</p><form class="pc-form" method="post" action="/admin/pod-ccc" enctype="multipart/form-data"><div class="pc-upload"><label>1. Plan săptămânal ID–nume</label><input type="file" name="mapping_file" accept=".xlsx" required></div><div class="pc-upload"><label>2. Raport POD</label><input type="file" name="pod_file" accept=".csv" required></div><div class="pc-upload"><label>3. Raport CCC</label><input type="file" name="ccc_file" accept=".csv" required></div><button class="pc-btn pc-primary" type="submit">Generează rapoartele</button></form></section>{result_html}</main></body></html>'''
+
+
+@app.get("/admin/pod-ccc", response_class=HTMLResponse)
+def pod_ccc_page():
+    return HTMLResponse(pod_ccc_html())
+
+
+@app.post("/admin/pod-ccc", response_class=HTMLResponse)
+async def pod_ccc_upload(
+    mapping_file: UploadFile = File(...),
+    pod_file: UploadFile = File(...),
+    ccc_file: UploadFile = File(...)
+):
+    files = (mapping_file, pod_file, ccc_file)
+    try:
+        mapping_raw, pod_raw, ccc_raw = [
+            await upload.read(POD_CCC_MAX_FILE_BYTES + 1) for upload in files
+        ]
+        if any(len(raw) > POD_CCC_MAX_FILE_BYTES for raw in (mapping_raw, pod_raw, ccc_raw)):
+            raise ValueError("Unul dintre fișiere depășește limita de 12 MB.")
+        if not (mapping_file.filename or "").lower().endswith(".xlsx"):
+            raise ValueError("Lista ID–nume trebuie să fie un fișier XLSX.")
+        if not (pod_file.filename or "").lower().endswith(".csv") or not (ccc_file.filename or "").lower().endswith(".csv"):
+            raise ValueError("Rapoartele POD și CCC trebuie să fie fișiere CSV.")
+        mapping = extract_transporter_mapping(mapping_raw)
+        pod_rows, _ = decode_amazon_csv(pod_raw)
+        ccc_rows, _ = decode_amazon_csv(ccc_raw)
+        pod_groups, pod_unmapped = group_quality_issues(pod_rows, mapping, "POD")
+        ccc_groups, ccc_unmapped = group_quality_issues(ccc_rows, mapping, "CCC")
+        if not pod_groups and not ccc_groups:
+            raise ValueError("Rapoartele nu conțin cazuri POD sau CCC.")
+        processed = {}
+        for kind, filename, groups, unmapped in (
+            ("POD", pod_file.filename or "", pod_groups, pod_unmapped),
+            ("CCC", ccc_file.filename or "", ccc_groups, ccc_unmapped)
+        ):
+            report_date = parse_report_date(filename)
+            workbook_bytes = build_quality_workbook(kind, report_date, groups)
+            processed[kind] = {
+                "date": report_date,
+                "groups": groups,
+                "unmapped": unmapped,
+                "xlsx": base64.b64encode(workbook_bytes).decode("ascii")
+            }
+        return HTMLResponse(pod_ccc_html(processed))
+    except (ValueError, openpyxl.utils.exceptions.InvalidFileException, zipfile.BadZipFile) as exc:
+        return HTMLResponse(pod_ccc_html(error=str(exc)), status_code=400)
+    finally:
+        for upload in files:
+            await upload.close()
 
 
 @app.get("/admin/mentor", response_class=HTMLResponse)
@@ -2924,6 +3202,7 @@ th{{font-size:12px;color:#667085;background:#fafafa}}
     <div class="actions">
       <a class="btn btn-light" href="/admin?d={selected}">FICO Dashboard</a>
       <a class="btn btn-light" href="/admin/hours">Control ore</a>
+      <a class="btn btn-light" href="/admin/pod-ccc">POD & CCC</a>
       <a class="btn btn-light" href="/admin/owner">Owner</a>
       <button class="btn btn-dark" type="button" onclick="copyMissing()">Copiază șoferii lipsă</button>
     </div>
@@ -3942,6 +4221,7 @@ th{{font-size:13px;color:#667085;text-transform:uppercase;letter-spacing:.4px}}
     <div class="top-actions">
         <a class="btn-light" href="/admin/mentor?d={selected}">Mentor Check</a>
         <a class="btn-light" href="/admin/hours">Control ore</a>
+        <a class="btn-light" href="/admin/pod-ccc">POD & CCC</a>
         <a class="btn-light" href="/admin/owner">Owner</a>
         <form method="post" action="/admin/logout" style="margin:0">
             <button class="btn-light" type="submit">Ieșire</button>
