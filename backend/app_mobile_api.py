@@ -970,6 +970,43 @@ main>.topbar .subtitle,.wrap>.topbar .subtitle{
 </style>
 '''
 
+SITE_ENTRY_GUARD_SCRIPT = r'''
+<script>
+(() => {
+  const path = window.location.pathname;
+  const params = new URLSearchParams(window.location.search);
+  const loginPage = path === '/admin/login' || path === '/admin/login/';
+  const publicPage = loginPage || path.startsWith('/admin/forgot-password') ||
+    path.startsWith('/admin/reset-password') || path.startsWith('/admin/setup-name');
+
+  if (loginPage && params.get('fresh') === '1') {
+    sessionStorage.removeItem('fico_authenticated_this_tab');
+  }
+
+  if (path.startsWith('/admin') && !publicPage &&
+      sessionStorage.getItem('fico_authenticated_this_tab') !== '1') {
+    const destination = path + window.location.search;
+    window.location.replace('/admin/login?fresh=1&next=' + encodeURIComponent(destination));
+    return;
+  }
+
+  const loginForm = document.querySelector('form[action="/admin/login"]');
+  if (loginForm) {
+    loginForm.addEventListener('submit', () => {
+      sessionStorage.setItem('fico_authenticated_this_tab', '1');
+    });
+  }
+
+  const logoutForm = document.querySelector('form[action="/admin/logout"]');
+  if (logoutForm) {
+    logoutForm.addEventListener('submit', () => {
+      sessionStorage.removeItem('fico_authenticated_this_tab');
+    });
+  }
+})();
+</script>
+'''
+
 
 @app.middleware("http")
 async def persist_site_language(request: Request, call_next):
@@ -996,7 +1033,7 @@ async def persist_site_language(request: Request, call_next):
         )
         page = page.replace(
             "</body>",
-            dark_style + SITE_LANGUAGE_SCRIPT + "</body>",
+            dark_style + SITE_ENTRY_GUARD_SCRIPT + SITE_LANGUAGE_SCRIPT + "</body>",
             1
         )
     headers = dict(response.headers)
@@ -1050,10 +1087,26 @@ async def protect_admin_routes(request: Request, call_next):
 
 
 @app.get("/admin/login", response_class=HTMLResponse)
-def admin_login_page(request: Request, next: str | None = None, error: str | None = None):
-    current = get_valid_admin_session(request.cookies.get(ADMIN_COOKIE_NAME))
-    if current:
+def admin_login_page(
+    request: Request,
+    next: str | None = None,
+    error: str | None = None,
+    fresh: int | None = None
+):
+    existing_token = request.cookies.get(ADMIN_COOKIE_NAME)
+    current = get_valid_admin_session(existing_token)
+    force_login = fresh == 1
+    if current and not force_login:
         return RedirectResponse(next or "/admin", status_code=303)
+
+    if force_login and existing_token:
+        conn = db()
+        conn.execute(
+            "UPDATE admin_sessions SET revoked=1 WHERE session_token=?",
+            (existing_token,)
+        )
+        conn.commit()
+        conn.close()
 
     conn = db()
     configured = bool(get_shared_password_hash(conn))
@@ -1213,6 +1266,8 @@ togglePassword.addEventListener("click", () => {{
     response = HTMLResponse(page)
     response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
     response.headers["Pragma"] = "no-cache"
+    if force_login:
+        response.delete_cookie(ADMIN_COOKIE_NAME)
     return response
 
 
