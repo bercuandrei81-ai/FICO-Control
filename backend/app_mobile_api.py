@@ -4348,7 +4348,7 @@ th{{font-size:13px;color:#667085;text-transform:uppercase;letter-spacing:.4px}}
 .calendar-legend{{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-top:14px;color:#667085;font-size:12px}}
 .legend-dot{{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:5px}}
 .legend-dot.saved{{background:#14804a}}
-@media(max-width:1500px){{.side-nav{{position:static;width:100%;margin-bottom:16px}}.side-brand{{display:none}}.side-nav-links{{display:grid;grid-template-columns:repeat(4,1fr)}}.side-link{{justify-content:center}}}}
+@media(max-width:1500px){{.side-nav{{position:static;width:100%;margin-bottom:16px}}.side-brand{{display:none}}.side-nav-links{{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr))}}.side-link{{justify-content:center}}}}
 @media(max-width:850px){{.stats{{grid-template-columns:repeat(2,1fr)}}.topbar{{display:block}}.top-actions{{margin-top:18px}}.side-nav-links{{grid-template-columns:repeat(2,1fr)}}}}
 @media(max-width:520px){{.stats{{grid-template-columns:1fr}}h1{{font-size:30px}}.search{{min-width:100%;width:100%}}.control-group{{width:100%}}.calendar-panel{{padding:14px}}.calendar-header{{align-items:flex-start}}.calendar-month{{font-size:20px}}.calendar-day{{min-height:54px;padding:7px}}.calendar-count{{display:none}}}}
 </style>
@@ -4363,6 +4363,7 @@ th{{font-size:13px;color:#667085;text-transform:uppercase;letter-spacing:.4px}}
         <a class="side-link" href="/admin/hours"><i></i>Control ore</a>
         <a class="side-link" href="/admin/pod-ccc"><i></i>POD & CCC</a>
         <a class="side-link" href="/admin/concessions"><i></i>Concesii</a>
+        <a class="side-link" href="https://clinquant-sawine-dba777.netlify.app/" target="_blank" rel="noopener noreferrer"><i></i>A doua reîncercare</a>
     </nav>
 </aside>
 <main class="admin">
