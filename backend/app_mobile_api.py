@@ -896,7 +896,7 @@ def admin_login_page(request: Request, next: str | None = None, error: str | Non
 <title>FICO Control Admin Login</title>
 <style>
 *{{box-sizing:border-box}}
-body{{margin:0;min-height:100vh;background:#101820 url('/login-background?v=mr-logistics-compact-vans-3') center center/cover no-repeat fixed;font-family:Arial,sans-serif;color:#17212b;position:relative}}
+body{{margin:0;min-height:100vh;background:#101820 url('/login-background?v=mr-logistics-fleet-plates-4') center center/cover no-repeat fixed;font-family:Arial,sans-serif;color:#17212b;position:relative}}
 body::before{{content:"";position:fixed;inset:0;background:rgba(4,12,22,.20);pointer-events:none}}
 .wrap{{position:relative;z-index:1;width:min(92%,470px);margin:0 auto;min-height:100vh;display:flex;align-items:center;padding:32px 0}}
 .card{{width:100%;background:rgba(255,255,255,.96);border:1px solid rgba(255,255,255,.65);backdrop-filter:blur(8px);border-radius:22px;padding:30px;box-shadow:0 18px 55px rgba(0,0,0,.30)}}
