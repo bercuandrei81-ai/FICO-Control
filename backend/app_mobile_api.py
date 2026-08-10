@@ -1,5 +1,5 @@
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
-from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse, FileResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse, FileResponse, Response
 from pydantic import BaseModel
 from datetime import date, datetime, timedelta, timezone, time
 import sqlite3
@@ -822,6 +822,145 @@ button{{border:0;background:#17212b;color:#fff;font-weight:800;cursor:pointer}}
 </body>
 </html>
 """
+
+
+SITE_LANGUAGE_SCRIPT = r'''
+<script>
+(() => {
+  const translations = {
+    de: {
+      "Admin Dashboard":"Admin-Dashboard","Conectat ca:":"Angemeldet als:","Bază date:":"Datenbank:",
+      "Programați":"Eingeplant","Au trimis":"Gesendet","Lipsesc":"Fehlen","FICO sub 800":"FICO unter 800","Necesită verificare":"Prüfung erforderlich",
+      "Istoric FICO":"FICO-Verlauf","Astăzi":"Heute","Zi cu listă salvată":"Tag mit gespeicherter Liste","Zi afișată:":"Angezeigter Tag:",
+      "Afișează":"Anzeigen","Reset":"Zurücksetzen","Lista zilnică din Cortex":"Tagesliste aus Cortex","Încarcă Excel Cortex":"Cortex-Excel hochladen",
+      "Aplicația extrage automat șoferii din coloana „Name des Fahrers”.":"Die Anwendung liest die Fahrer automatisch aus der Spalte „Name des Fahrers“ aus.",
+      "Șofer":"Fahrer","Status":"Status","FICO introdus":"Eingegebener FICO","FICO detectat":"Erkannter FICO","Verificare":"Prüfung","Ora":"Uhrzeit","Dovadă":"Nachweis",
+      "Mentor Check":"Mentor-Prüfung","Control ore":"Arbeitszeitkontrolle","POD & CCC":"POD & CCC","Concesii":"Konzessionen","A doua reîncercare":"Zweiter Zustellversuch",
+      "Owner":"Inhaber","Ieșire":"Abmelden","Export Excel":"Excel exportieren","Copiază șoferii lipsă":"Fehlende Fahrer kopieren","Copiat":"Kopiert",
+      "INSTRUMENTE FICO":"FICO-WERKZEUGE","Control ore șoferi":"Fahrer-Arbeitszeiten","Data verificării":"Prüfdatum","Caută șofer":"Fahrer suchen",
+      "Șoferi verificați":"Geprüfte Fahrer","Peste 10 ore":"Über 10 Stunden","10h 30m sau mai mult":"10 Std. 30 Min. oder mehr","cu ore reale":"mit echten Arbeitszeiten",
+      "necesită atenție":"Aufmerksamkeit erforderlich","limită critică":"kritische Grenze","Ore lucrate":"Arbeitsstunden","Interval real":"Tatsächlicher Zeitraum",
+      "Blocuri":"Blöcke","Total lucrat":"Gesamtarbeitszeit","Încarcă raportul săptămânal Amazon":"Wöchentlichen Amazon-Bericht hochladen","Verifică orele":"Arbeitszeiten prüfen",
+      "Descarcă CSV":"CSV herunterladen","Încarcă raportul pentru a vedea orele lucrate.":"Lade den Bericht hoch, um die Arbeitszeiten zu sehen.",
+      "Încarcă cele trei fișiere Amazon":"Die drei Amazon-Dateien hochladen","Generează rapoartele":"Berichte erstellen","Descarcă Excel POD":"POD-Excel herunterladen","Descarcă Excel CCC":"CCC-Excel herunterladen",
+      "Înlocuire automată Transporter ID cu numele real și rapoarte profesionale":"Transporter-ID automatisch durch den echten Namen ersetzen und professionelle Berichte erstellen",
+      "Planul săptămânal furnizează numele reale. POD și CCC sunt procesate separat.":"Der Wochenplan liefert die echten Namen. POD und CCC werden getrennt verarbeitet.",
+      "1. Plan săptămânal ID–nume":"1. Wochenplan ID–Name","2. Raport POD":"2. POD-Bericht","3. Raport CCC":"3. CCC-Bericht","Raport":"Bericht","Cazuri":"Fälle","Atenție":"Achtung",
+      "Încarcă raportul Amazon Concessions":"Amazon-Concessions-Bericht hochladen","Generează Excel":"Excel erstellen","Descarcă Excel Concesii":"Concessions-Excel herunterladen",
+      "Raport săptămânal DNR ordonat și formatat automat":"Wöchentlicher DNR-Bericht, automatisch sortiert und formatiert",
+      "Șoferii cu cele mai multe concesii apar primii. Raportul final respectă modelul KW.":"Fahrer mit den meisten Konzessionen stehen zuerst. Der Abschlussbericht folgt dem KW-Modell.",
+      "Trebuie conectați":"Müssen verbunden sein","Persoane conectate":"Verbundene Personen","Nu s-au conectat":"Nicht verbunden","Verifică Mentor":"Mentor prüfen",
+      "1. Cortex":"1. Cortex","2. Mentor Shift Report":"2. Mentor-Schichtbericht","Compară lista Cortex cu Mentor Shift Report":"Cortex-Liste mit dem Mentor-Schichtbericht vergleichen",
+      "ȘOFER CORTEX":"CORTEX-FAHRER","STATUS MENTOR":"MENTOR-STATUS","PRIMA CONECTARE":"ERSTE VERBINDUNG","POTRIVIRE MENTOR":"MENTOR-ZUORDNUNG",
+      "Control acces Admin":"Admin-Zugriffskontrolle","Sesiuni":"Sitzungen","Nume blocate":"Gesperrte Namen","Ultima activitate":"Letzte Aktivität","Acțiune":"Aktion",
+      "Blochează":"Sperren","Deblochează":"Entsperren","Deconectează":"Abmelden","Nicio sesiune activă.":"Keine aktive Sitzung.","Niciun nume blocat.":"Keine gesperrten Namen.",
+      "Confirmare prin email":"Bestätigung per E-Mail","Trimite codul pe email":"Code per E-Mail senden","Confirmă codul":"Code bestätigen","Înapoi la Admin":"Zurück zum Admin",
+      "Schimbă parola":"Passwort ändern","Schimbă parola comună":"Gemeinsames Passwort ändern","Setează parola nouă":"Neues Passwort festlegen",
+      "Admin Login":"Admin-Anmeldung","Introdu numele tău și parola comună pentru a intra în Admin Dashboard.":"Gib deinen Namen und das gemeinsame Passwort ein, um das Admin-Dashboard zu öffnen.",
+      "Numele tău":"Dein Name","Parola":"Passwort","Ai uitat parola?":"Passwort vergessen?","Intră în Admin":"Admin öffnen","Înapoi la login":"Zurück zur Anmeldung"
+    },
+    en: {
+      "Admin Dashboard":"Admin Dashboard","Conectat ca:":"Signed in as:","Bază date:":"Database:",
+      "Programați":"Scheduled","Au trimis":"Submitted","Lipsesc":"Missing","FICO sub 800":"FICO below 800","Necesită verificare":"Needs review",
+      "Istoric FICO":"FICO history","Astăzi":"Today","Zi cu listă salvată":"Day with saved list","Zi afișată:":"Displayed day:",
+      "Afișează":"Show","Reset":"Reset","Lista zilnică din Cortex":"Daily Cortex list","Încarcă Excel Cortex":"Upload Cortex Excel",
+      "Aplicația extrage automat șoferii din coloana „Name des Fahrers”.":"The app automatically extracts drivers from the “Name des Fahrers” column.",
+      "Șofer":"Driver","Status":"Status","FICO introdus":"Entered FICO","FICO detectat":"Detected FICO","Verificare":"Verification","Ora":"Time","Dovadă":"Proof",
+      "Mentor Check":"Mentor Check","Control ore":"Hours control","POD & CCC":"POD & CCC","Concesii":"Concessions","A doua reîncercare":"Second reattempt",
+      "Owner":"Owner","Ieșire":"Log out","Export Excel":"Export Excel","Copiază șoferii lipsă":"Copy missing drivers","Copiat":"Copied",
+      "INSTRUMENTE FICO":"FICO TOOLS","Control ore șoferi":"Driver hours control","Data verificării":"Check date","Caută șofer":"Search driver",
+      "Șoferi verificați":"Checked drivers","Peste 10 ore":"Over 10 hours","10h 30m sau mai mult":"10h 30m or more","cu ore reale":"with actual hours",
+      "necesită atenție":"needs attention","limită critică":"critical limit","Ore lucrate":"Hours worked","Interval real":"Actual interval","Blocuri":"Blocks","Total lucrat":"Total worked",
+      "Încarcă raportul săptămânal Amazon":"Upload the weekly Amazon report","Verifică orele":"Check hours","Descarcă CSV":"Download CSV","Încarcă raportul pentru a vedea orele lucrate.":"Upload the report to view worked hours.",
+      "Încarcă cele trei fișiere Amazon":"Upload the three Amazon files","Generează rapoartele":"Generate reports","Descarcă Excel POD":"Download POD Excel","Descarcă Excel CCC":"Download CCC Excel",
+      "Înlocuire automată Transporter ID cu numele real și rapoarte profesionale":"Automatically replace Transporter ID with the real name and create professional reports",
+      "Planul săptămânal furnizează numele reale. POD și CCC sunt procesate separat.":"The weekly plan provides real names. POD and CCC are processed separately.",
+      "1. Plan săptămânal ID–nume":"1. Weekly ID–name plan","2. Raport POD":"2. POD report","3. Raport CCC":"3. CCC report","Raport":"Report","Cazuri":"Cases","Atenție":"Attention",
+      "Încarcă raportul Amazon Concessions":"Upload Amazon Concessions report","Generează Excel":"Generate Excel","Descarcă Excel Concesii":"Download Concessions Excel",
+      "Raport săptămânal DNR ordonat și formatat automat":"Weekly DNR report, automatically sorted and formatted","Șoferii cu cele mai multe concesii apar primii. Raportul final respectă modelul KW.":"Drivers with the most concessions appear first. The final report follows the KW model.",
+      "Trebuie conectați":"Must be connected","Persoane conectate":"Connected people","Nu s-au conectat":"Not connected","Verifică Mentor":"Check Mentor",
+      "1. Cortex":"1. Cortex","2. Mentor Shift Report":"2. Mentor Shift Report","Compară lista Cortex cu Mentor Shift Report":"Compare the Cortex list with the Mentor Shift Report",
+      "ȘOFER CORTEX":"CORTEX DRIVER","STATUS MENTOR":"MENTOR STATUS","PRIMA CONECTARE":"FIRST CONNECTION","POTRIVIRE MENTOR":"MENTOR MATCH",
+      "Control acces Admin":"Admin access control","Sesiuni":"Sessions","Nume blocate":"Blocked names","Ultima activitate":"Last activity","Acțiune":"Action","Blochează":"Block","Deblochează":"Unblock","Deconectează":"Disconnect",
+      "Nicio sesiune activă.":"No active sessions.","Niciun nume blocat.":"No blocked names.","Confirmare prin email":"Email confirmation","Trimite codul pe email":"Send code by email","Confirmă codul":"Confirm code","Înapoi la Admin":"Back to Admin",
+      "Schimbă parola":"Change password","Schimbă parola comună":"Change shared password","Setează parola nouă":"Set new password",
+      "Admin Login":"Admin Login","Introdu numele tău și parola comună pentru a intra în Admin Dashboard.":"Enter your name and the shared password to open the Admin Dashboard.",
+      "Numele tău":"Your name","Parola":"Password","Ai uitat parola?":"Forgot password?","Intră în Admin":"Open Admin","Înapoi la login":"Back to login"
+    }
+  };
+  const originals = new WeakMap();
+  const normalizeLang = value => ['ro','de','en'].includes(value) ? value : 'ro';
+  let lang = normalizeLang(localStorage.getItem('fico_lang') || 'ro');
+  function translateTextNode(node) {
+    if (!originals.has(node)) originals.set(node, node.nodeValue);
+    const original = originals.get(node);
+    const clean = original.trim();
+    if (!clean) return;
+    const translated = lang === 'ro' ? clean : (translations[lang][clean] || clean);
+    node.nodeValue = original.replace(clean, translated);
+  }
+  function translate(root=document.body) {
+    document.documentElement.lang = lang;
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+    let node; while ((node = walker.nextNode())) {
+      if (!node.parentElement || ['SCRIPT','STYLE','TEXTAREA'].includes(node.parentElement.tagName)) continue;
+      translateTextNode(node);
+    }
+    document.querySelectorAll('input[placeholder]').forEach(el => {
+      if (!el.dataset.ficoOriginalPlaceholder) el.dataset.ficoOriginalPlaceholder = el.placeholder;
+      const original = el.dataset.ficoOriginalPlaceholder;
+      el.placeholder = lang === 'ro' ? original : (translations[lang][original] || original);
+    });
+    document.querySelectorAll('[data-lang]').forEach(btn => btn.classList.toggle('active', btn.dataset.lang === lang));
+    document.querySelectorAll('[data-site-lang]').forEach(btn => btn.classList.toggle('active', btn.dataset.siteLang === lang));
+  }
+  function selectLanguage(next) {
+    lang = normalizeLang(next);
+    localStorage.setItem('fico_lang', lang);
+    document.cookie = 'fico_lang=' + lang + '; path=/; max-age=31536000; SameSite=Lax';
+    translate();
+  }
+  document.querySelectorAll('[data-lang]').forEach(btn => btn.addEventListener('click', () => selectLanguage(btn.dataset.lang)));
+  if (!document.querySelector('.langs')) {
+    const picker = document.createElement('div');
+    picker.className = 'fico-language-switcher';
+    picker.innerHTML = '<button data-site-lang="ro">RO</button><button data-site-lang="de">DE</button><button data-site-lang="en">EN</button>';
+    document.body.appendChild(picker);
+    picker.querySelectorAll('button').forEach(btn => btn.addEventListener('click', () => selectLanguage(btn.dataset.siteLang)));
+  }
+  const style = document.createElement('style');
+  style.textContent = '.fico-language-switcher{position:fixed;right:16px;bottom:16px;z-index:9999;display:flex;gap:4px;padding:5px;background:rgba(255,255,255,.94);border:1px solid #d8dde3;border-radius:10px;box-shadow:0 5px 18px rgba(0,0,0,.12)}.fico-language-switcher button{width:auto!important;margin:0!important;padding:7px 9px!important;border:0;border-radius:7px;background:#f2f4f7;color:#667085;font-size:12px;font-weight:800;cursor:pointer}.fico-language-switcher button.active{background:#17212b;color:#fff}';
+  document.head.appendChild(style);
+  translate();
+  new MutationObserver(records => records.forEach(record => record.addedNodes.forEach(node => {
+    if (node.nodeType === Node.TEXT_NODE) translateTextNode(node);
+    else if (node.nodeType === Node.ELEMENT_NODE) translate(node);
+  }))).observe(document.body, {childList:true,subtree:true});
+})();
+</script>
+'''
+
+
+@app.middleware("http")
+async def persist_site_language(request: Request, call_next):
+    response = await call_next(request)
+    content_type = response.headers.get("content-type", "")
+    if "text/html" not in content_type.lower():
+        return response
+    body = b""
+    async for chunk in response.body_iterator:
+        body += chunk
+    page = body.decode("utf-8", errors="replace")
+    if "</body>" in page:
+        page = page.replace("</body>", SITE_LANGUAGE_SCRIPT + "</body>", 1)
+    headers = dict(response.headers)
+    headers.pop("content-length", None)
+    return Response(
+        content=page,
+        status_code=response.status_code,
+        headers=headers,
+        media_type="text/html"
+    )
 
 
 @app.middleware("http")
