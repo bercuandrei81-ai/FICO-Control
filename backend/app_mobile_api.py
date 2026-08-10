@@ -37,6 +37,10 @@ MR_LOGISTICS_LOGO = os.path.join(
     os.path.dirname(__file__),
     "ChatGPT Image 8. Aug. 2026, 15_20_51.png"
 )
+LOGIN_BACKGROUND = os.path.join(
+    os.path.dirname(__file__),
+    "amazon-login-background.webp"
+)
 
 R2_ENABLED = all([
     R2_ACCESS_KEY_ID,
@@ -471,6 +475,17 @@ def brand_logo():
     )
 
 
+@app.get("/login-background")
+def login_background():
+    if not os.path.isfile(LOGIN_BACKGROUND):
+        raise HTTPException(status_code=404, detail="login_background_not_found")
+    return FileResponse(
+        LOGIN_BACKGROUND,
+        media_type="image/webp",
+        headers={"Cache-Control": "public, max-age=86400"}
+    )
+
+
 @app.get("/health/db")
 def health_db():
     try:
@@ -881,13 +896,14 @@ def admin_login_page(request: Request, next: str | None = None, error: str | Non
 <title>FICO Control Admin Login</title>
 <style>
 *{{box-sizing:border-box}}
-body{{margin:0;background:#f4f6f8;font-family:Arial,sans-serif;color:#17212b}}
-.wrap{{width:min(92%,470px);margin:65px auto}}
-.card{{background:#fff;border-radius:22px;padding:30px;box-shadow:0 12px 35px rgba(0,0,0,.08)}}
+body{{margin:0;min-height:100vh;background:#101820 url('/login-background') center center/cover no-repeat fixed;font-family:Arial,sans-serif;color:#17212b;position:relative}}
+body::before{{content:"";position:fixed;inset:0;background:linear-gradient(90deg,rgba(4,12,22,.13),rgba(4,12,22,.22) 48%,rgba(4,12,22,.46));pointer-events:none}}
+.wrap{{position:relative;z-index:1;width:min(92%,470px);margin:0 max(5vw,70px) 0 auto;min-height:100vh;display:flex;align-items:center;padding:32px 0}}
+.card{{width:100%;background:rgba(255,255,255,.96);border:1px solid rgba(255,255,255,.65);backdrop-filter:blur(8px);border-radius:22px;padding:30px;box-shadow:0 18px 55px rgba(0,0,0,.30)}}
 .brand{{font-size:13px;font-weight:900;letter-spacing:2px}}
 .login-logo-wrap{{display:flex;justify-content:center;margin:2px 0 18px}}
 .login-logo{{display:block;width:min(230px,75%);height:auto;object-fit:contain}}
-h1{{font-size:31px;margin:22px 0 8px}}
+h1{{font-size:31px;margin:18px 0 8px}}
 .subtitle{{color:#667085;line-height:1.5;margin-bottom:22px}}
 label{{display:block;font-weight:800;margin:16px 0 7px}}
 input,button{{width:100%;padding:14px;border-radius:11px;font-size:16px}}
@@ -903,6 +919,12 @@ button{{margin-top:22px;border:0;background:#17212b;color:#fff;font-weight:800;c
 .langs button.active{{background:#17212b;color:#fff}}
 .forgot{{display:block;text-align:right;margin-top:11px;color:#475467;text-decoration:none;font-weight:700;font-size:14px}}
 .forgot:hover{{text-decoration:underline}}
+@media(max-width:760px){{
+ body{{background-position:38% center;background-attachment:scroll}}
+ body::before{{background:rgba(4,12,22,.42)}}
+ .wrap{{margin:0 auto;padding:22px 0}}
+ .card{{padding:24px}}
+}}
 </style>
 </head>
 <body>
@@ -918,7 +940,6 @@ button{{margin-top:22px;border:0;background:#17212b;color:#fff;font-weight:800;c
 <img class="login-logo" src="/brand-logo" alt="MR Logistics">
 </div>
 
-<div class="brand">FICO CONTROL</div>
 <h1 id="title">Admin Login</h1>
 <p class="subtitle" id="subtitle">Introdu numele tău și parola comună pentru a intra în Admin Dashboard.</p>
 
