@@ -4267,7 +4267,14 @@ def admin_page(request: Request, d: str | None = None, q: str | None = None):
 <style>
 *{{box-sizing:border-box}}
 body{{margin:0;font-family:Arial,Helvetica,sans-serif;background:#f4f6f8;color:#17212b}}
-.admin{{width:min(96%,1280px);margin:30px auto 60px}}
+.app-shell{{width:min(97%,1540px);margin:28px auto 60px;display:grid;grid-template-columns:210px minmax(0,1fr);gap:24px;align-items:start}}
+.admin{{width:100%;min-width:0;margin:0}}
+.side-nav{{position:sticky;top:22px;background:#17212b;color:#fff;border-radius:18px;padding:18px;box-shadow:0 7px 22px rgba(23,33,43,.16)}}
+.side-brand{{font-size:11px;font-weight:900;letter-spacing:1.8px;color:#aeb8c4;margin:3px 4px 16px}}
+.side-nav-links{{display:flex;flex-direction:column;gap:9px}}
+.side-link{{display:flex;align-items:center;gap:10px;color:#fff;text-decoration:none;padding:13px 12px;border-radius:10px;font-size:14px;font-weight:800;border:1px solid rgba(255,255,255,.13);background:rgba(255,255,255,.055)}}
+.side-link:hover{{background:rgba(255,255,255,.14)}}
+.side-link i{{width:9px;height:9px;border-radius:50%;background:#22b5e5;flex:0 0 auto}}
 .topbar{{display:flex;align-items:flex-start;justify-content:space-between;gap:20px;margin-bottom:28px}}
 .brand{{font-size:13px;font-weight:800;letter-spacing:2px}}
 h1{{font-size:38px;margin:14px 0 0}}
@@ -4341,12 +4348,23 @@ th{{font-size:13px;color:#667085;text-transform:uppercase;letter-spacing:.4px}}
 .calendar-legend{{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-top:14px;color:#667085;font-size:12px}}
 .legend-dot{{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:5px}}
 .legend-dot.saved{{background:#14804a}}
-@media(max-width:850px){{.stats{{grid-template-columns:repeat(2,1fr)}}.topbar{{display:block}}.top-actions{{margin-top:18px}}}}
+@media(max-width:1000px){{.app-shell{{grid-template-columns:1fr}}.side-nav{{position:static}}.side-nav-links{{display:grid;grid-template-columns:repeat(4,1fr)}}.side-link{{justify-content:center}}}}
+@media(max-width:850px){{.stats{{grid-template-columns:repeat(2,1fr)}}.topbar{{display:block}}.top-actions{{margin-top:18px}}.side-nav-links{{grid-template-columns:repeat(2,1fr)}}}}
 @media(max-width:520px){{.stats{{grid-template-columns:1fr}}h1{{font-size:30px}}.search{{min-width:100%;width:100%}}.control-group{{width:100%}}.calendar-panel{{padding:14px}}.calendar-header{{align-items:flex-start}}.calendar-month{{font-size:20px}}.calendar-day{{min-height:54px;padding:7px}}.calendar-count{{display:none}}}}
 </style>
 </head>
 <body>
 
+<div class="app-shell">
+<aside class="side-nav">
+    <div class="side-brand">INSTRUMENTE FICO</div>
+    <nav class="side-nav-links">
+        <a class="side-link" href="/admin/mentor?d={selected}"><i></i>Mentor Check</a>
+        <a class="side-link" href="/admin/hours"><i></i>Control ore</a>
+        <a class="side-link" href="/admin/pod-ccc"><i></i>POD & CCC</a>
+        <a class="side-link" href="/admin/concessions"><i></i>Concesii</a>
+    </nav>
+</aside>
 <main class="admin">
 
 <div class="topbar">
@@ -4360,10 +4378,6 @@ th{{font-size:13px;color:#667085;text-transform:uppercase;letter-spacing:.4px}}
     </div>
 
     <div class="top-actions">
-        <a class="btn-light" href="/admin/mentor?d={selected}">Mentor Check</a>
-        <a class="btn-light" href="/admin/hours">Control ore</a>
-        <a class="btn-light" href="/admin/pod-ccc">POD & CCC</a>
-        <a class="btn-light" href="/admin/concessions">Concesii</a>
         <a class="btn-light" href="/admin/owner">Owner</a>
         <form method="post" action="/admin/logout" style="margin:0">
             <button class="btn-light" type="submit">Ieșire</button>
@@ -4411,6 +4425,7 @@ th{{font-size:13px;color:#667085;text-transform:uppercase;letter-spacing:.4px}}
 </section>
 
 </main>
+</div>
 
 <script>
 const missingNames = `{missing_js}`;
