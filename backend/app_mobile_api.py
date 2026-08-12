@@ -14,8 +14,8 @@ from difflib import SequenceMatcher
 import json
 import urllib.request
 import urllib.parse
-import re
-import base64
+import reƒ
+ƒimport base64
 import secrets
 import hmac
 import hashlib
