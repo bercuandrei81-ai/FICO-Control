@@ -5425,6 +5425,9 @@ def atlas_build_assignments(
 
     return assignments, review
 
+def atlas_package_count_label(count: int) -> str:
+    return f"{count} pachet" if count == 1 else f"{count} pachete"
+
 
 def atlas_build_excel(assignments, review):
     workbook = openpyxl.Workbook()
@@ -5438,7 +5441,7 @@ def atlas_build_excel(assignments, review):
     red = "FDEEEE"
     line = "D8DDE3"
 
-    worksheet.merge_cells("A1:D1")
+    worksheet.merge_cells("A1:E1")
     title = worksheet["A1"]
     title.value = "ATLAS PAKET"
     title.font = openpyxl.styles.Font(
@@ -5457,7 +5460,13 @@ def atlas_build_excel(assignments, review):
     )
     worksheet.row_dimensions[1].height = 32
 
-    headers = ["Șofer", "Route Code", "Tracking ID", "Status"]
+    headers = [
+        "Șofer",
+        "Route Code",
+        "Nr. pachete",
+        "Tracking ID",
+        "Status"
+    ]
 
     for column, value in enumerate(headers, start=1):
         cell = worksheet.cell(2, column, value)
@@ -5471,7 +5480,8 @@ def atlas_build_excel(assignments, review):
             fgColor=dark
         )
         cell.alignment = openpyxl.styles.Alignment(
-            horizontal="center"
+            horizontal="center",
+            vertical="center"
         )
 
     row_index = 3
@@ -5484,10 +5494,15 @@ def atlas_build_excel(assignments, review):
         ).append(item["tracking"])
 
     for (driver, route), tracking_ids in grouped.items():
+        package_label = atlas_package_count_label(
+            len(tracking_ids)
+        )
+
         for position, tracking_id in enumerate(tracking_ids):
             values = [
                 driver if position == 0 else "",
-                route,
+                route if position == 0 else "",
+                package_label if position == 0 else "",
                 tracking_id,
                 "OK"
             ]
@@ -5505,7 +5520,12 @@ def atlas_build_excel(assignments, review):
                     )
                 )
                 cell.alignment = openpyxl.styles.Alignment(
-                    vertical="center"
+                    vertical="center",
+                    horizontal=(
+                        "center"
+                        if column in {2, 3, 5}
+                        else "left"
+                    )
                 )
 
             if position == 0:
@@ -5515,6 +5535,14 @@ def atlas_build_excel(assignments, review):
                 ).font = openpyxl.styles.Font(
                     name="Arial",
                     bold=True
+                )
+                worksheet.cell(
+                    row_index,
+                    3
+                ).font = openpyxl.styles.Font(
+                    name="Arial",
+                    bold=True,
+                    color="14804A"
                 )
 
             row_index += 1
@@ -5531,7 +5559,7 @@ def atlas_build_excel(assignments, review):
             start_row=row_index,
             start_column=1,
             end_row=row_index,
-            end_column=4
+            end_column=5
         )
         worksheet.cell(
             row_index,
@@ -5547,6 +5575,7 @@ def atlas_build_excel(assignments, review):
             values = [
                 item.get("file", ""),
                 item.get("route", ""),
+                "",
                 item.get("tracking", ""),
                 item.get("reason", "")
             ]
@@ -5566,8 +5595,9 @@ def atlas_build_excel(assignments, review):
 
     worksheet.column_dimensions["A"].width = 34
     worksheet.column_dimensions["B"].width = 18
-    worksheet.column_dimensions["C"].width = 23
-    worksheet.column_dimensions["D"].width = 42
+    worksheet.column_dimensions["C"].width = 18
+    worksheet.column_dimensions["D"].width = 23
+    worksheet.column_dimensions["E"].width = 42
     worksheet.freeze_panes = "A3"
 
     output = io.BytesIO()
@@ -5575,7 +5605,6 @@ def atlas_build_excel(assignments, review):
     workbook.close()
 
     return output.getvalue()
-
 
 def atlas_page_html(assignments=None, review=None, error=""):
     assignments = assignments or []
@@ -5597,19 +5626,57 @@ def atlas_page_html(assignments=None, review=None, error=""):
             grouped.setdefault(key, []).append(item["tracking"])
 
         assignment_rows = ""
+        copy_sections = []
 
         for (driver, route), tracking_ids in grouped.items():
+            package_count = len(tracking_ids)
+            package_label = atlas_package_count_label(
+                package_count
+            )
+
+            copy_sections.append(
+                "\n".join([
+                    f"{driver} — {route} — {package_label}",
+                    *tracking_ids
+                ])
+            )
+
             for position, tracking_id in enumerate(tracking_ids):
+                group_cells = ""
+
+                if position == 0:
+                    group_cells = f"""
+                    <td
+                      class="atlas-group-cell"
+                      rowspan="{package_count}"
+                    >
+                      <strong>{html.escape(driver)}</strong>
+                    </td>
+                    <td
+                      class="atlas-group-cell atlas-route"
+                      rowspan="{package_count}"
+                    >
+                      {html.escape(route)}
+                    </td>
+                    <td
+                      class="atlas-group-cell"
+                      rowspan="{package_count}"
+                    >
+                      <span class="atlas-count">
+                        {html.escape(package_label)}
+                      </span>
+                    </td>
+                    """
+
                 assignment_rows += f"""
-                <tr>
+                <tr class="{'atlas-group-start' if position == 0 else ''}">
+                  {group_cells}
                   <td>
-                    <strong>
-                      {html.escape(driver) if position == 0 else ""}
-                    </strong>
+                    <code>{html.escape(tracking_id)}</code>
                   </td>
-                  <td>{html.escape(route)}</td>
-                  <td><code>{html.escape(tracking_id)}</code></td>
-                  <td><span class="atlas-ok">OK</span></td>
+                  <td>
+                    <span class="atlas-ok">OK</span>
+                  </td>
                 </tr>
                 """
 
@@ -5627,17 +5694,15 @@ def atlas_page_html(assignments=None, review=None, error=""):
             </tr>
             """
 
-        excel_bytes = atlas_build_excel(assignments, review)
+        excel_bytes = atlas_build_excel(
+            assignments,
+            review
+        )
         excel_base64 = base64.b64encode(
             excel_bytes
         ).decode("ascii")
 
-        copy_text = "\n".join(
-            f"{item['driver']} | "
-            f"{item['route']} | "
-            f"{item['tracking']}"
-            for item in assignments
-        )
+        copy_text = "\n\n".join(copy_sections)
 
         review_block = ""
 
@@ -5697,6 +5762,7 @@ def atlas_page_html(assignments=None, review=None, error=""):
               <tr>
                 <th>Șofer</th>
                 <th>Route Code</th>
+                <th>Pachete</th>
                 <th>Tracking ID</th>
                 <th>Status</th>
               </tr>
@@ -5704,7 +5770,7 @@ def atlas_page_html(assignments=None, review=None, error=""):
             <tbody>
               {
                 assignment_rows
-                or '<tr><td colspan="4">'
+                or '<tr><td colspan="5">'
                    'Niciun pachet atribuit automat.'
                    '</td></tr>'
               }
@@ -5726,10 +5792,15 @@ def atlas_page_html(assignments=None, review=None, error=""):
           }}
 
           try {{
-            await navigator.clipboard.writeText(atlasCopyText);
+            await navigator.clipboard.writeText(
+              atlasCopyText
+            );
             alert("Lista Atlas a fost copiată.");
           }} catch (error) {{
-            window.prompt("Copiază lista:", atlasCopyText);
+            window.prompt(
+              "Copiază lista:",
+              atlasCopyText
+            );
           }}
         }}
         </script>
@@ -5740,7 +5811,10 @@ def atlas_page_html(assignments=None, review=None, error=""):
 <html lang="ro">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta
+  name="viewport"
+  content="width=device-width,initial-scale=1"
+>
 <title>Atlas Paket · FICO Control</title>
 <style>
 *{{box-sizing:border-box}}
@@ -5797,7 +5871,11 @@ h1{{
   margin-top:22px;
   border-radius:18px;
   padding:26px;
-  background:linear-gradient(120deg,#0d4f6b,#177e9c);
+  background:linear-gradient(
+    120deg,
+    #0d4f6b,
+    #177e9c
+  );
   color:#fff
 }}
 .atlas-hero h2{{margin:0 0 7px}}
@@ -5880,7 +5958,8 @@ h1{{
 .atlas-table td{{
   padding:13px 15px;
   border-bottom:1px solid #edf0f2;
-  text-align:left
+  text-align:left;
+  vertical-align:middle
 }}
 .atlas-table th{{
   background:#fafafa;
@@ -5891,6 +5970,28 @@ h1{{
 .atlas-table code{{
   font-weight:800;
   color:#17212b
+}}
+.atlas-group-start td{{
+  border-top:2px solid #d8dde3
+}}
+.atlas-group-cell{{
+  background:#fbfcfd
+}}
+.atlas-route{{
+  font-weight:800
+}}
+.atlas-count{{
+  display:inline-flex;
+  align-items:center;
+  justify-content:center;
+  min-width:88px;
+  padding:7px 10px;
+  border-radius:999px;
+  background:#e7f8ef;
+  color:#147a42;
+  font-size:12px;
+  font-weight:900;
+  white-space:nowrap
 }}
 .atlas-ok{{
   background:#e9f8ef;
@@ -5920,19 +6021,37 @@ h1{{
 <main class="atlas-wrap">
   <div class="atlas-top">
     <div>
-      <div class="atlas-brand">FICO CONTROL</div>
+      <div class="atlas-brand">
+        FICO CONTROL
+      </div>
       <h1>Atlas Paket</h1>
       <div class="atlas-sub">
-        Cortex + pozele Amazon Atlas → șoferul și pachetele corecte
+        Cortex + pozele Amazon Atlas →
+        șoferul și pachetele corecte
       </div>
     </div>
 
     <div class="atlas-actions">
-      <a class="atlas-btn" href="/admin">FICO Dashboard</a>
-      <a class="atlas-btn" href="/admin/mentor">Mentor Check</a>
-      <a class="atlas-btn" href="/admin/hours">Control ore</a>
-      <a class="atlas-btn" href="/admin/pod-ccc">POD & CCC</a>
-      <a class="atlas-btn" href="/admin/concessions">Concesii</a>
+      <a
+        class="atlas-btn"
+        href="/admin"
+      >FICO Dashboard</a>
+      <a
+        class="atlas-btn"
+        href="/admin/mentor"
+      >Mentor Check</a>
+      <a
+        class="atlas-btn"
+        href="/admin/hours"
+      >Control ore</a>
+      <a
+        class="atlas-btn"
+        href="/admin/pod-ccc"
+      >POD & CCC</a>
+      <a
+        class="atlas-btn"
+        href="/admin/concessions"
+      >Concesii</a>
     </div>
   </div>
 
@@ -5942,9 +6061,11 @@ h1{{
     <h2>Generează distribuirea Atlas</h2>
 
     <p>
-      Încarcă Excelul Cortex cu rutele normale și toate pozele
-      Transfer Sheet primite de la Amazon. V2 citește fiecare rând,
-      chiar dacă aceeași poză conține mai multe rute.
+      Încarcă Excelul Cortex cu rutele normale
+      și toate pozele Transfer Sheet primite de
+      la Amazon. Sistemul afișează numărul de
+      pachete pentru fiecare rută, inclusiv când
+      există un singur pachet.
     </p>
 
     <form
@@ -5964,8 +6085,9 @@ h1{{
         >
 
         <small>
-          Routencode + primul nume din Name des Fahrers.
-          Rescue-ul după | este ignorat.
+          Routencode + primul nume din
+          Name des Fahrers. Rescue-ul după |
+          este ignorat.
         </small>
       </div>
 
@@ -5981,8 +6103,9 @@ h1{{
         >
 
         <small>
-          Selectează toate paginile. Page 2 poate continua ruta
-          începută la finalul Page 1.
+          Selectează toate paginile.
+          Page 2 poate continua ruta începută
+          la finalul Page 1.
         </small>
       </div>
 
@@ -5998,7 +6121,6 @@ h1{{
 </body>
 </html>
 """
-
 
 @app.get("/admin/atlas-paket", response_class=HTMLResponse)
 def atlas_paket_page():
