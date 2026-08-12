@@ -14,8 +14,8 @@ from difflib import SequenceMatcher
 import json
 import urllib.request
 import urllib.parse
-import reƒ
-ƒimport base64
+import re
+import base64
 import secrets
 import hmac
 import hashlib
@@ -4624,6 +4624,7 @@ th{{font-size:13px;color:#667085;text-transform:uppercase;letter-spacing:.4px}}
         <a class="side-link" href="/admin/hours"><i></i>Control ore</a>
         <a class="side-link" href="/admin/pod-ccc"><i></i>POD & CCC</a>
         <a class="side-link" href="/admin/concessions"><i></i>Concesii</a>
+        <a class="side-link" href="/admin/atlas-paket"><i></i>Atlas Paket</a>
         <a class="side-link" href="https://clinquant-sawine-dba777.netlify.app/" target="_blank" rel="noopener noreferrer"><i></i>A doua reîncercare</a>
     </nav>
 </aside>
@@ -4834,3 +4835,729 @@ def export_day_excel(d: str | None = None):
             f'attachment; filename="{filename}"'
         }
     )
+
+# ============================================================================
+# ATLAS PAKET V1
+# Cortex XLSX + multiple Amazon Transfer Sheet images -> Driver / Route / TID
+# ============================================================================
+
+ATLAS_MAX_IMAGES = 12
+ATLAS_MAX_IMAGE_BYTES = 12 * 1024 * 1024
+ATLAS_ALLOWED_TYPES = {"image/jpeg", "image/png", "image/webp"}
+
+
+def atlas_clean_route(value: str) -> str:
+    value = str(value or "").upper().strip()
+    value = re.sub(r"\s+", "", value)
+    value = value.replace("-", "_")
+    return value
+
+
+def atlas_extract_cortex_routes(raw: bytes) -> dict:
+    workbook = openpyxl.load_workbook(
+        io.BytesIO(raw),
+        read_only=True,
+        data_only=True
+    )
+
+    try:
+        ws = (
+            workbook["Strecken"]
+            if "Strecken" in workbook.sheetnames
+            else workbook[workbook.sheetnames[0]]
+        )
+
+        rows = ws.iter_rows(values_only=True)
+        headers = next(rows, None)
+
+        if not headers:
+            raise ValueError("Cortex-ul nu conține antet.")
+
+        normalized = [
+            re.sub(r"\s+", " ", str(h or "")).strip().casefold()
+            for h in headers
+        ]
+
+        route_candidates = ["routencode", "route code", "route", "route-code"]
+        driver_candidates = [
+            "name des fahrers",
+            "fahrername",
+            "driver name",
+            "fahrer"
+        ]
+
+        route_idx = next(
+            (normalized.index(x) for x in route_candidates if x in normalized),
+            None
+        )
+        driver_idx = next(
+            (normalized.index(x) for x in driver_candidates if x in normalized),
+            None
+        )
+
+        if route_idx is None:
+            raise ValueError("Nu am găsit coloana Routencode în Cortex.")
+        if driver_idx is None:
+            raise ValueError("Nu am găsit coloana Name des Fahrers în Cortex.")
+
+        result = {}
+
+        for row in rows:
+            if route_idx >= len(row) or driver_idx >= len(row):
+                continue
+
+            route = atlas_clean_route(row[route_idx])
+            raw_driver = str(row[driver_idx] or "").strip()
+
+            if not route or not raw_driver:
+                continue
+
+            parts = re.split(r"[|\n\r]+", raw_driver)
+            driver = next((p.strip() for p in parts if p.strip()), "")
+
+            if route and driver:
+                result[route] = driver
+
+        if not result:
+            raise ValueError("Nu am găsit rute valide în Cortex.")
+
+        return result
+    finally:
+        workbook.close()
+
+
+def atlas_ocr_text(raw: bytes, content_type: str) -> str:
+    api_key = os.getenv("OCRSPACE_API_KEY", "").strip()
+
+    if not api_key:
+        raise ValueError(
+            "OCRSPACE_API_KEY nu este configurat în Render. "
+            "Atlas Paket are nevoie de OCR pentru a citi pozele Amazon."
+        )
+
+    boundary = "----AtlasPaketBoundary7MA4YWxkTrZu0gW"
+
+    ext = "jpg"
+    if content_type == "image/png":
+        ext = "png"
+    elif content_type == "image/webp":
+        ext = "webp"
+
+    parts = []
+
+    def add_field(name, value):
+        parts.append(
+            (
+                f"--{boundary}\r\n"
+                f'Content-Disposition: form-data; name="{name}"\r\n\r\n'
+                f"{value}\r\n"
+            ).encode("utf-8")
+        )
+
+    add_field("apikey", api_key)
+    add_field("language", "eng")
+    add_field("isOverlayRequired", "false")
+    add_field("OCREngine", "2")
+    add_field("scale", "true")
+    add_field("detectOrientation", "true")
+
+    parts.append(
+        (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="file"; filename="atlas.{ext}"\r\n'
+            f"Content-Type: {content_type}\r\n\r\n"
+        ).encode("utf-8")
+        + raw
+        + b"\r\n"
+    )
+
+    parts.append(f"--{boundary}--\r\n".encode("utf-8"))
+    body = b"".join(parts)
+
+    request = urllib.request.Request(
+        "https://api.ocr.space/parse/image",
+        data=body,
+        headers={
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+            "User-Agent": "FICO-Control-Atlas/1.0"
+        },
+        method="POST"
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=35) as response:
+            payload = json.loads(
+                response.read().decode("utf-8", errors="replace")
+            )
+    except Exception as exc:
+        raise ValueError(
+            "OCR-ul nu a putut citi una dintre pozele Atlas."
+        ) from exc
+
+    if payload.get("IsErroredOnProcessing"):
+        message = payload.get("ErrorMessage") or payload.get("ErrorDetails")
+        if isinstance(message, list):
+            message = " ".join(str(x) for x in message)
+        raise ValueError(
+            "OCR Atlas: " + str(message or "eroare necunoscută")
+        )
+
+    parsed = payload.get("ParsedResults") or []
+    text = "\n".join(
+        str(item.get("ParsedText") or "")
+        for item in parsed
+    ).strip()
+
+    if not text:
+        raise ValueError(
+            "Una dintre pozele Atlas nu a putut fi citită. "
+            "Încarcă o poză mai clară."
+        )
+
+    return text
+
+
+def atlas_extract_tracking_ids(text: str) -> list[str]:
+    compact = re.sub(r"(?<=\w)[\s\-]+(?=\w)", "", str(text or "").upper())
+    ids = re.findall(r"\bDE\d{10}\b", compact)
+
+    seen = set()
+    result = []
+    for tracking in ids:
+        if tracking not in seen:
+            seen.add(tracking)
+            result.append(tracking)
+
+    return result
+
+
+def atlas_extract_routes(text: str) -> list[str]:
+    upper = str(text or "").upper()
+
+    generic = re.findall(
+        r"\b(CA|SA|SB|SC)[\s_-]*A[\s_-]*(\d{1,3})\b",
+        upper
+    )
+
+    routes = [f"{prefix}_A{number}" for prefix, number in generic]
+
+    seen = set()
+    clean = []
+    for route in routes:
+        route = atlas_clean_route(route)
+        if route and route not in seen:
+            seen.add(route)
+            clean.append(route)
+
+    return clean
+
+
+def atlas_parse_image_text(text: str, filename: str) -> dict:
+    return {
+        "filename": filename,
+        "routes": atlas_extract_routes(text),
+        "tracking_ids": atlas_extract_tracking_ids(text),
+        "ocr_text": text
+    }
+
+
+def atlas_build_assignments(cortex_routes: dict, pages: list[dict]):
+    assignments = []
+    review = []
+    seen_tracking = set()
+
+    for page in pages:
+        valid_routes = [
+            route for route in page["routes"]
+            if route in cortex_routes
+        ]
+        valid_routes = list(dict.fromkeys(valid_routes))
+
+        if len(valid_routes) != 1:
+            reason = (
+                "Nu am identificat ruta din Cortex"
+                if not valid_routes
+                else "Am identificat mai multe rute în aceeași poză"
+            )
+
+            for tid in page["tracking_ids"] or ["—"]:
+                review.append({
+                    "file": page["filename"],
+                    "route": ", ".join(page["routes"]) or "—",
+                    "tracking": tid,
+                    "reason": reason
+                })
+            continue
+
+        route = valid_routes[0]
+        driver = cortex_routes[route]
+
+        if not page["tracking_ids"]:
+            review.append({
+                "file": page["filename"],
+                "route": route,
+                "tracking": "—",
+                "reason": "Nu am identificat niciun Tracking ID"
+            })
+            continue
+
+        for tracking in page["tracking_ids"]:
+            if tracking in seen_tracking:
+                continue
+
+            seen_tracking.add(tracking)
+
+            assignments.append({
+                "driver": driver,
+                "route": route,
+                "tracking": tracking,
+                "file": page["filename"]
+            })
+
+    assignments.sort(
+        key=lambda x: (
+            x["driver"].casefold(),
+            x["route"],
+            x["tracking"]
+        )
+    )
+
+    return assignments, review
+
+
+def atlas_build_excel(assignments, review):
+    workbook = openpyxl.Workbook()
+    ws = workbook.active
+    ws.title = "Atlas Paket"
+    ws.sheet_view.showGridLines = False
+
+    dark = "17212B"
+    white = "FFFFFF"
+    green = "E9F8EF"
+    red = "FDEEEE"
+    line = "D8DDE3"
+
+    ws.merge_cells("A1:D1")
+    title = ws["A1"]
+    title.value = "ATLAS PAKET"
+    title.font = openpyxl.styles.Font(
+        name="Arial",
+        size=17,
+        bold=True,
+        color=white
+    )
+    title.fill = openpyxl.styles.PatternFill(
+        "solid",
+        fgColor=dark
+    )
+    title.alignment = openpyxl.styles.Alignment(
+        horizontal="center",
+        vertical="center"
+    )
+
+    headers = ["Șofer", "Route Code", "Tracking ID", "Status"]
+    for col, value in enumerate(headers, start=1):
+        cell = ws.cell(2, col, value)
+        cell.font = openpyxl.styles.Font(
+            name="Arial",
+            bold=True,
+            color=white
+        )
+        cell.fill = openpyxl.styles.PatternFill(
+            "solid",
+            fgColor=dark
+        )
+
+    row_idx = 3
+
+    grouped = {}
+    for item in assignments:
+        grouped.setdefault(
+            (item["driver"], item["route"]),
+            []
+        ).append(item["tracking"])
+
+    for (driver, route), trackings in grouped.items():
+        for position, tracking in enumerate(trackings):
+            values = [
+                driver if position == 0 else "",
+                route,
+                tracking,
+                "OK"
+            ]
+
+            for col, value in enumerate(values, start=1):
+                cell = ws.cell(row_idx, col, value)
+                cell.fill = openpyxl.styles.PatternFill(
+                    "solid",
+                    fgColor=green
+                )
+                cell.border = openpyxl.styles.Border(
+                    bottom=openpyxl.styles.Side(
+                        style="thin",
+                        color=line
+                    )
+                )
+
+            if position == 0:
+                ws.cell(row_idx, 1).font = openpyxl.styles.Font(
+                    name="Arial",
+                    bold=True
+                )
+
+            row_idx += 1
+
+    if review:
+        row_idx += 1
+        ws.cell(row_idx, 1, "NECESITĂ VERIFICARE")
+        ws.merge_cells(
+            start_row=row_idx,
+            start_column=1,
+            end_row=row_idx,
+            end_column=4
+        )
+        ws.cell(row_idx, 1).font = openpyxl.styles.Font(
+            bold=True,
+            color="B42318"
+        )
+        row_idx += 1
+
+        for item in review:
+            values = [
+                item.get("file", ""),
+                item.get("route", ""),
+                item.get("tracking", ""),
+                item.get("reason", "")
+            ]
+
+            for col, value in enumerate(values, start=1):
+                cell = ws.cell(row_idx, col, value)
+                cell.fill = openpyxl.styles.PatternFill(
+                    "solid",
+                    fgColor=red
+                )
+                cell.alignment = openpyxl.styles.Alignment(
+                    wrap_text=True
+                )
+
+            row_idx += 1
+
+    ws.column_dimensions["A"].width = 34
+    ws.column_dimensions["B"].width = 18
+    ws.column_dimensions["C"].width = 23
+    ws.column_dimensions["D"].width = 40
+    ws.freeze_panes = "A3"
+
+    output = io.BytesIO()
+    workbook.save(output)
+    workbook.close()
+    return output.getvalue()
+
+
+def atlas_page_html(assignments=None, review=None, error=""):
+    assignments = assignments or []
+    review = review or []
+
+    error_html = (
+        f'<div class="atlas-error"><strong>Eroare:</strong> '
+        f'{html.escape(error)}</div>'
+        if error else ""
+    )
+
+    result_html = ""
+
+    if assignments or review:
+        grouped = {}
+        for item in assignments:
+            key = (item["driver"], item["route"])
+            grouped.setdefault(key, []).append(item["tracking"])
+
+        rows = ""
+        for (driver, route), trackings in grouped.items():
+            for idx, tracking in enumerate(trackings):
+                rows += f"""
+                <tr>
+                  <td><strong>{html.escape(driver) if idx == 0 else ""}</strong></td>
+                  <td>{html.escape(route)}</td>
+                  <td><code>{html.escape(tracking)}</code></td>
+                  <td><span class="atlas-ok">OK</span></td>
+                </tr>
+                """
+
+        review_rows = ""
+        for item in review:
+            review_rows += f"""
+            <tr class="atlas-review-row">
+              <td>{html.escape(item.get("file", "—"))}</td>
+              <td>{html.escape(item.get("route", "—"))}</td>
+              <td><code>{html.escape(item.get("tracking", "—"))}</code></td>
+              <td>{html.escape(item.get("reason", ""))}</td>
+            </tr>
+            """
+
+        excel_bytes = atlas_build_excel(assignments, review)
+        excel_b64 = base64.b64encode(excel_bytes).decode("ascii")
+
+        copy_text = "\n".join(
+            f"{item['driver']} | {item['route']} | {item['tracking']}"
+            for item in assignments
+        )
+
+        review_block = ""
+        if review:
+            review_block = f"""
+            <section class="atlas-table atlas-review">
+              <div class="atlas-review-title">Necesită verificare ({len(review)})</div>
+              <table>
+                <thead>
+                  <tr>
+                    <th>Poză</th>
+                    <th>Rută citită</th>
+                    <th>Tracking ID</th>
+                    <th>Motiv</th>
+                  </tr>
+                </thead>
+                <tbody>{review_rows}</tbody>
+              </table>
+            </section>
+            """
+
+        result_html = f"""
+        <section class="atlas-stats">
+          <div class="atlas-stat">
+            <span>Pachete identificate</span>
+            <strong>{len(assignments)}</strong>
+          </div>
+          <div class="atlas-stat">
+            <span>Șoferi cu Atlas</span>
+            <strong>{len(grouped)}</strong>
+          </div>
+          <div class="atlas-stat atlas-warn">
+            <span>Necesită verificare</span>
+            <strong>{len(review)}</strong>
+          </div>
+        </section>
+
+        <div class="atlas-result-actions">
+          <a
+            class="atlas-btn atlas-primary"
+            download="Atlas_Paket.xlsx"
+            href="data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,{excel_b64}"
+          >Descarcă Excel</a>
+          <button class="atlas-btn" type="button" onclick="copyAtlas()">Copiază lista</button>
+        </div>
+
+        <section class="atlas-table">
+          <table>
+            <thead>
+              <tr>
+                <th>Șofer</th>
+                <th>Route Code</th>
+                <th>Tracking ID</th>
+                <th>Status</th>
+              </tr>
+            </thead>
+            <tbody>{rows or '<tr><td colspan="4">Niciun pachet atribuit automat.</td></tr>'}</tbody>
+          </table>
+        </section>
+
+        {review_block}
+
+        <script>
+        const atlasCopyText = {json.dumps(copy_text, ensure_ascii=False)};
+
+        async function copyAtlas() {{
+          if (!atlasCopyText) {{
+            alert("Nu există pachete de copiat.");
+            return;
+          }}
+
+          try {{
+            await navigator.clipboard.writeText(atlasCopyText);
+            alert("Lista Atlas a fost copiată.");
+          }} catch (e) {{
+            window.prompt("Copiază lista:", atlasCopyText);
+          }}
+        }}
+        </script>
+        """
+
+    return f"""
+<!doctype html>
+<html lang="ro">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Atlas Paket · FICO Control</title>
+<style>
+*{{box-sizing:border-box}}
+body{{margin:0;background:#f4f6f8;color:#17212b;font-family:Arial,sans-serif}}
+.atlas-wrap{{width:min(96%,1200px);margin:28px auto 60px}}
+.atlas-top{{display:flex;justify-content:space-between;align-items:flex-start;gap:18px}}
+.atlas-brand{{font-size:12px;font-weight:900;letter-spacing:2px}}
+h1{{font-size:38px;margin:9px 0 5px}}
+.atlas-sub{{color:#667085}}
+.atlas-actions{{display:flex;gap:8px;flex-wrap:wrap}}
+.atlas-btn{{display:inline-flex;align-items:center;justify-content:center;text-decoration:none;border:1px solid #d8dde3;border-radius:10px;padding:12px 15px;background:#fff;color:#17212b;font-weight:800;cursor:pointer}}
+.atlas-primary{{background:#17212b;color:#fff;border-color:#17212b}}
+.atlas-hero{{margin-top:22px;border-radius:18px;padding:26px;background:linear-gradient(120deg,#0d4f6b,#177e9c);color:#fff}}
+.atlas-hero h2{{margin:0 0 7px}}
+.atlas-hero p{{margin:0 0 20px;color:#d5edf3;line-height:1.5}}
+.atlas-form{{display:grid;grid-template-columns:1fr 1fr auto;gap:12px;align-items:end}}
+.atlas-upload{{background:#fff;color:#17212b;padding:14px;border-radius:12px}}
+.atlas-upload label{{display:block;font-size:12px;font-weight:900;margin-bottom:8px}}
+.atlas-upload small{{display:block;color:#667085;margin-top:7px;line-height:1.4}}
+.atlas-upload input{{max-width:100%}}
+.atlas-error{{margin-top:16px;padding:14px 16px;background:#fff0f0;border-left:4px solid #d92d20;color:#9f2f27}}
+.atlas-stats{{display:grid;grid-template-columns:repeat(3,1fr);gap:13px;margin-top:18px}}
+.atlas-stat{{background:#fff;border:1px solid #e4e7ec;border-radius:15px;padding:18px;display:flex;justify-content:space-between;align-items:center}}
+.atlas-stat span{{color:#667085;font-weight:800;font-size:13px}}
+.atlas-stat strong{{font-size:32px}}
+.atlas-warn strong{{color:#b42318}}
+.atlas-result-actions{{display:flex;gap:9px;margin:15px 0}}
+.atlas-table{{overflow:hidden;background:#fff;border:1px solid #e4e7ec;border-radius:15px;margin-top:14px}}
+.atlas-table table{{width:100%;border-collapse:collapse}}
+.atlas-table th,.atlas-table td{{padding:13px 15px;border-bottom:1px solid #edf0f2;text-align:left}}
+.atlas-table th{{background:#fafafa;color:#667085;font-size:11px;text-transform:uppercase}}
+.atlas-table code{{font-weight:800;color:#17212b}}
+.atlas-ok{{background:#e9f8ef;color:#14804a;border-radius:999px;padding:6px 9px;font-size:11px;font-weight:900}}
+.atlas-review{{border-color:#f0c2bd}}
+.atlas-review-title{{padding:15px;background:#fff7f6;color:#b42318;font-weight:900}}
+.atlas-review-row{{background:#fffafa}}
+@media(max-width:850px){{.atlas-top{{display:block}}.atlas-actions{{margin-top:14px}}.atlas-form{{grid-template-columns:1fr}}.atlas-stats{{grid-template-columns:1fr}}}}
+</style>
+</head>
+<body>
+<main class="atlas-wrap">
+  <div class="atlas-top">
+    <div>
+      <div class="atlas-brand">FICO CONTROL</div>
+      <h1>Atlas Paket</h1>
+      <div class="atlas-sub">Cortex + pozele Amazon Atlas → șoferul și pachetele corecte</div>
+    </div>
+    <div class="atlas-actions">
+      <a class="atlas-btn" href="/admin">FICO Dashboard</a>
+      <a class="atlas-btn" href="/admin/mentor">Mentor Check</a>
+      <a class="atlas-btn" href="/admin/hours">Control ore</a>
+      <a class="atlas-btn" href="/admin/pod-ccc">POD & CCC</a>
+      <a class="atlas-btn" href="/admin/concessions">Concesii</a>
+    </div>
+  </div>
+
+  {error_html}
+
+  <section class="atlas-hero">
+    <h2>Generează distribuirea Atlas</h2>
+    <p>
+      Încarcă Excelul Cortex cu rutele normale și toate pozele Transfer Sheet
+      primite de la Amazon. Poți selecta mai multe poze simultan.
+    </p>
+
+    <form class="atlas-form" method="post" action="/admin/atlas-paket" enctype="multipart/form-data">
+      <div class="atlas-upload">
+        <label>1. Excel Cortex</label>
+        <input type="file" name="cortex_file" accept=".xlsx" required>
+        <small>Se folosesc Routencode + primul nume din Name des Fahrers. Rescue-ul după | este ignorat.</small>
+      </div>
+
+      <div class="atlas-upload">
+        <label>2. Poze Atlas Amazon</label>
+        <input type="file" name="atlas_images" accept="image/jpeg,image/png,image/webp" multiple required>
+        <small>Selectează 2, 3, 4, 5 sau mai multe poze într-o singură alegere.</small>
+      </div>
+
+      <button class="atlas-btn atlas-primary" type="submit">Generează Atlas</button>
+    </form>
+  </section>
+
+  {result_html}
+</main>
+</body>
+</html>
+"""
+
+
+@app.get("/admin/atlas-paket", response_class=HTMLResponse)
+def atlas_paket_page():
+    return HTMLResponse(atlas_page_html())
+
+
+@app.post("/admin/atlas-paket", response_class=HTMLResponse)
+async def atlas_paket_generate(
+    cortex_file: UploadFile = File(...),
+    atlas_images: list[UploadFile] = File(...)
+):
+    try:
+        if not (cortex_file.filename or "").lower().endswith(".xlsx"):
+            raise ValueError("Cortex trebuie să fie un fișier XLSX.")
+
+        cortex_raw = await cortex_file.read(15 * 1024 * 1024 + 1)
+
+        if len(cortex_raw) > 15 * 1024 * 1024:
+            raise ValueError("Excelul Cortex este prea mare.")
+
+        cortex_routes = atlas_extract_cortex_routes(cortex_raw)
+        images = list(atlas_images or [])
+
+        if not images:
+            raise ValueError("Selectează cel puțin o poză Atlas.")
+
+        if len(images) > ATLAS_MAX_IMAGES:
+            raise ValueError(
+                f"Poți încărca maximum {ATLAS_MAX_IMAGES} poze Atlas odată."
+            )
+
+        pages = []
+
+        for image in images:
+            content_type = (image.content_type or "").lower()
+
+            if content_type not in ATLAS_ALLOWED_TYPES:
+                raise ValueError(
+                    f"{image.filename or 'O poză'} nu este JPG, PNG sau WEBP."
+                )
+
+            raw = await image.read(ATLAS_MAX_IMAGE_BYTES + 1)
+
+            if not raw:
+                raise ValueError(
+                    f"{image.filename or 'O poză'} este goală."
+                )
+
+            if len(raw) > ATLAS_MAX_IMAGE_BYTES:
+                raise ValueError(
+                    f"{image.filename or 'O poză'} depășește 12 MB."
+                )
+
+            ocr_text = atlas_ocr_text(raw, content_type)
+            pages.append(
+                atlas_parse_image_text(
+                    ocr_text,
+                    image.filename or "Atlas"
+                )
+            )
+
+        assignments, review = atlas_build_assignments(
+            cortex_routes,
+            pages
+        )
+
+        if not assignments and not review:
+            raise ValueError(
+                "Nu am identificat niciun pachet Atlas în pozele încărcate."
+            )
+
+        return HTMLResponse(
+            atlas_page_html(assignments, review)
+        )
+
+    except ValueError as exc:
+        return HTMLResponse(
+            atlas_page_html(error=str(exc)),
+            status_code=400
+        )
+
+    finally:
+        await cortex_file.close()
+        for image in atlas_images or []:
+            await image.close()
