@@ -840,7 +840,7 @@ SITE_LANGUAGE_SCRIPT = r'''
       "INSTRUMENTE FICO":"FICO-WERKZEUGE","Control ore șoferi":"Fahrer-Arbeitszeiten","Data verificării":"Prüfdatum","Caută șofer":"Fahrer suchen",
       "Șoferi verificați":"Geprüfte Fahrer","Peste 10 ore":"Über 10 Stunden","10h 30m sau mai mult":"10 Std. 30 Min. oder mehr","cu ore reale":"mit echten Arbeitszeiten",
       "necesită atenție":"Aufmerksamkeit erforderlich","limită critică":"kritische Grenze","Ore lucrate":"Arbeitsstunden","Interval real":"Tatsächlicher Zeitraum",
-      "Blocuri":"Blöcke","Total lucrat":"Gesamtarbeitszeit","Încarcă raportul săptămânal Amazon":"Wöchentlichen Amazon-Bericht hochladen","Verifică orele":"Arbeitszeiten prüfen",
+      "Blocuri":"Blöcke","Total lucrat":"Gesamtarbeitszeit","Încarcă raportul săptămânal Amazon":"Wöchentlichen Amazon-Bericht hochladen","Încarcă Anfahrlisten Amazon":"Amazon-Anfahrlisten hochladen","Șoferii sunt grupați după Transporter-ID. Toate rutele sunt adunate, iar intervalele suprapuse nu sunt numărate de două ori.":"Die Fahrer werden nach Transporter-ID gruppiert. Alle Routen werden addiert, überlappende Zeiträume jedoch nur einmal gezählt.","Anfahrlisten Amazon XLSX":"Amazon-Anfahrlisten XLSX","Verifică orele":"Arbeitszeiten prüfen",
       "Descarcă CSV":"CSV herunterladen","Încarcă raportul pentru a vedea orele lucrate.":"Lade den Bericht hoch, um die Arbeitszeiten zu sehen.",
       "Încarcă cele trei fișiere Amazon":"Die drei Amazon-Dateien hochladen","Generează rapoartele":"Berichte erstellen","Descarcă Excel POD":"POD-Excel herunterladen","Descarcă Excel CCC":"CCC-Excel herunterladen",
       "Înlocuire automată Transporter ID cu numele real și rapoarte profesionale":"Transporter-ID automatisch durch den echten Namen ersetzen und professionelle Berichte erstellen",
@@ -871,7 +871,7 @@ SITE_LANGUAGE_SCRIPT = r'''
       "INSTRUMENTE FICO":"FICO TOOLS","Control ore șoferi":"Driver hours control","Data verificării":"Check date","Caută șofer":"Search driver",
       "Șoferi verificați":"Checked drivers","Peste 10 ore":"Over 10 hours","10h 30m sau mai mult":"10h 30m or more","cu ore reale":"with actual hours",
       "necesită atenție":"needs attention","limită critică":"critical limit","Ore lucrate":"Hours worked","Interval real":"Actual interval","Blocuri":"Blocks","Total lucrat":"Total worked",
-      "Încarcă raportul săptămânal Amazon":"Upload the weekly Amazon report","Verifică orele":"Check hours","Descarcă CSV":"Download CSV","Încarcă raportul pentru a vedea orele lucrate.":"Upload the report to view worked hours.",
+      "Încarcă raportul săptămânal Amazon":"Upload the weekly Amazon report","Încarcă Anfahrlisten Amazon":"Upload Amazon Anfahrlisten","Șoferii sunt grupați după Transporter-ID. Toate rutele sunt adunate, iar intervalele suprapuse nu sunt numărate de două ori.":"Drivers are grouped by Transporter ID. All routes are added, while overlapping intervals are counted only once.","Anfahrlisten Amazon XLSX":"Amazon Anfahrlisten XLSX","Verifică orele":"Check hours","Descarcă CSV":"Download CSV","Încarcă raportul pentru a vedea orele lucrate.":"Upload the report to view worked hours.",
       "Încarcă cele trei fișiere Amazon":"Upload the three Amazon files","Generează rapoartele":"Generate reports","Descarcă Excel POD":"Download POD Excel","Descarcă Excel CCC":"Download CCC Excel",
       "Înlocuire automată Transporter ID cu numele real și rapoarte profesionale":"Automatically replace Transporter ID with the real name and create professional reports",
       "Planul săptămânal furnizează numele reale. POD și CCC sunt procesate separat.":"The weekly plan provides real names. POD and CCC are processed separately.",
@@ -2918,10 +2918,229 @@ def parse_service_details_csv(csv_bytes: bytes):
     return sorted(results, key=lambda row: (row["date"], row["name"].casefold()))
 
 
+def parse_anfahrlisten_clock(value):
+    if value is None:
+        return None
+
+    if isinstance(value, datetime):
+        return value.time().replace(tzinfo=None)
+
+    if isinstance(value, time):
+        return value.replace(tzinfo=None)
+
+    if isinstance(value, (int, float)) and 0 <= value < 1:
+        seconds = int(round(float(value) * 24 * 60 * 60)) % (24 * 60 * 60)
+        return time(
+            hour=seconds // 3600,
+            minute=(seconds % 3600) // 60,
+            second=seconds % 60
+        )
+
+    clean = str(value).strip()
+    if not clean or clean.casefold() in {"fehlt", "missing", "none", "-"}:
+        return None
+
+    match = re.fullmatch(r"(\d{1,2}):(\d{2})(?::(\d{2}))?", clean)
+    if not match:
+        return None
+
+    hour, minute, second = (int(part or 0) for part in match.groups())
+    if hour > 23 or minute > 59 or second > 59:
+        return None
+    return time(hour=hour, minute=minute, second=second)
+
+
+def parse_anfahrlisten_filename(upload_name: str):
+    match = re.search(
+        r"(20\d{2})[-_](\d{2})[-_](\d{2})"
+        r"(?:[_ T-](\d{2})[_:\-](\d{2}))?",
+        upload_name or ""
+    )
+    if not match:
+        raise ValueError(
+            "Data nu a putut fi citită din numele fișierului Anfahrlisten."
+        )
+
+    try:
+        work_date = date(
+            int(match.group(1)),
+            int(match.group(2)),
+            int(match.group(3))
+        )
+    except ValueError as exc:
+        raise ValueError("Data din numele fișierului nu este validă.") from exc
+
+    snapshot_at = None
+    if match.group(4) is not None:
+        try:
+            snapshot_at = datetime.combine(
+                work_date,
+                time(int(match.group(4)), int(match.group(5))),
+                tzinfo=BERLIN_TZ
+            )
+        except ValueError as exc:
+            raise ValueError(
+                "Ora din numele fișierului Anfahrlisten nu este validă."
+            ) from exc
+
+    return work_date, snapshot_at
+
+
+def clean_anfahrlisten_name(value):
+    name = re.sub(r"\s*,\s*", " ", str(value or "").strip())
+    return re.sub(r"\s+", " ", name).strip()
+
+
+def parse_anfahrlisten_xlsx(upload_name: str, xlsx_bytes: bytes):
+    work_date, snapshot_at = parse_anfahrlisten_filename(upload_name)
+
+    try:
+        workbook = openpyxl.load_workbook(
+            io.BytesIO(xlsx_bytes),
+            read_only=True,
+            data_only=True
+        )
+    except (
+        zipfile.BadZipFile,
+        KeyError,
+        OSError,
+        ValueError,
+        openpyxl.utils.exceptions.InvalidFileException
+    ) as exc:
+        raise ValueError("Fișierul Anfahrlisten XLSX nu este valid.") from exc
+
+    required = {
+        "Transporter-ID",
+        "Name des Fahrers",
+        "Routencode",
+        "App-Anmeldung:",
+        "App-Abmeldung:"
+    }
+
+    try:
+        worksheet = workbook.active
+        header = None
+        rows = worksheet.iter_rows(values_only=True)
+
+        for candidate in rows:
+            normalized = [
+                re.sub(r"\s+", " ", str(value or "").replace("\xa0", " ")).strip()
+                for value in candidate
+            ]
+            if required.issubset(set(normalized)):
+                header = normalized
+                break
+
+        if header is None:
+            raise ValueError(
+                "Fișierul nu conține coloanele Anfahrlisten necesare."
+            )
+
+        indexes = {column: header.index(column) for column in required}
+        grouped = {}
+
+        for row in rows:
+            def cell(column):
+                index = indexes[column]
+                return row[index] if index < len(row) else None
+
+            driver_id = str(cell("Transporter-ID") or "").strip()
+            driver_name = clean_anfahrlisten_name(cell("Name des Fahrers"))
+            if not driver_id or not driver_name:
+                continue
+
+            start_clock = parse_anfahrlisten_clock(cell("App-Anmeldung:"))
+            if start_clock is None:
+                continue
+
+            start_at = datetime.combine(
+                work_date,
+                start_clock,
+                tzinfo=BERLIN_TZ
+            )
+            end_clock = parse_anfahrlisten_clock(cell("App-Abmeldung:"))
+            is_active = end_clock is None
+
+            if end_clock is None:
+                if snapshot_at is None:
+                    if work_date == datetime.now(BERLIN_TZ).date():
+                        end_at = datetime.now(BERLIN_TZ)
+                    else:
+                        continue
+                else:
+                    end_at = snapshot_at
+            else:
+                end_at = datetime.combine(
+                    work_date,
+                    end_clock,
+                    tzinfo=BERLIN_TZ
+                )
+                if end_at <= start_at:
+                    end_at += timedelta(days=1)
+
+            if end_at <= start_at:
+                continue
+
+            key = (work_date.isoformat(), driver_id)
+            group = grouped.setdefault(key, {
+                "name": driver_name,
+                "intervals": set(),
+                "routes": set(),
+                "active": False
+            })
+            group["intervals"].add((start_at, end_at))
+            group["active"] = group["active"] or is_active
+
+            route = str(cell("Routencode") or "").strip()
+            if route:
+                group["routes"].add(route)
+    finally:
+        workbook.close()
+
+    results = []
+    for (work_date_text, _driver_id), group in grouped.items():
+        merged = merge_work_intervals(group["intervals"])
+        total_seconds = int(sum(
+            (end_at - start_at).total_seconds()
+            for start_at, end_at in merged
+        ))
+        if not merged or total_seconds <= 0:
+            continue
+
+        total_minutes = total_seconds // 60
+        if total_minutes >= 630:
+            status = "critical"
+        elif total_minutes > 600:
+            status = "warning"
+        else:
+            status = "safe"
+
+        results.append({
+            "date": work_date_text,
+            "name": group["name"],
+            "start": min(start for start, _ in merged).strftime("%H:%M"),
+            "end": max(end for _, end in merged).strftime("%H:%M"),
+            "minutes": total_minutes,
+            "seconds": total_seconds,
+            "blocks": len(merged),
+            "routes": sorted(group["routes"]),
+            "status": status,
+            "active": group["active"]
+        })
+
+    return sorted(
+        results,
+        key=lambda row: (row["date"], row["name"].casefold())
+    )
+
+
 def read_hours_report(upload_name: str, payload: bytes):
     lower_name = (upload_name or "").lower()
     if len(payload) > HOURS_MAX_UPLOAD_BYTES:
         raise ValueError("Fișierul este prea mare. Limita este 15 MB.")
+
+    if lower_name.endswith(".xlsx"):
+        return parse_anfahrlisten_xlsx(upload_name, payload)
 
     if lower_name.endswith(".csv"):
         if len(payload) > HOURS_MAX_CSV_BYTES:
@@ -2929,7 +3148,7 @@ def read_hours_report(upload_name: str, payload: bytes):
         return parse_service_details_csv(payload)
 
     if not lower_name.endswith(".zip"):
-        raise ValueError("Încarcă arhiva ZIP sau Service Details Report CSV.")
+        raise ValueError("Încarcă fișierul Anfahrlisten XLSX.")
 
     try:
         with zipfile.ZipFile(io.BytesIO(payload)) as archive:
@@ -2960,7 +3179,7 @@ def hours_control_html(results=None, filename="", error=""):
     file_status = (
         f'<strong>{filename_safe}</strong><small>Raport analizat în memorie · fișierul nu a fost salvat</small>'
         if results else
-        '<strong>Niciun raport încărcat</strong><small>ZIP săptămânal sau Service Details CSV</small>'
+        '<strong>Niciun raport încărcat</strong><small>Anfahrlisten Amazon XLSX</small>'
     )
     return f"""
 <!doctype html>
@@ -2998,8 +3217,8 @@ tr.warning{{background:#fffaf0}}tr.critical{{background:#fff1f1}}tr.warning td:f
 <div class="topbar"><div><div class="brand">FICO CONTROL</div><h1>Control ore șoferi</h1><div class="subtitle">Verificare zilnică după Anmelden și Abmelden · limita maximă 10h 30m</div></div>
 <div class="actions"><a class="btn btn-light" href="/admin">FICO Dashboard</a><a class="btn btn-light" href="/admin/mentor">Mentor Check</a><a class="btn btn-light" href="/admin/pod-ccc">POD & CCC</a><a class="btn btn-light" href="/admin/concessions">Concesii</a><a class="btn btn-light" href="/admin/owner">Owner</a></div></div>
 {error_html}
-<section class="hero"><div><h2>Încarcă raportul săptămânal Amazon</h2><p>Este detectat automat „Service Details Report”. Dublurile identice și intervalele suprapuse nu sunt adunate de două ori.</p></div>
-<form class="upload" method="post" action="/admin/hours" enctype="multipart/form-data"><input type="file" name="report_file" accept=".zip,.csv" required><button class="btn btn-dark" type="submit">Verifică orele</button></form></section>
+<section class="hero"><div><h2>Încarcă Anfahrlisten Amazon</h2><p>Șoferii sunt grupați după Transporter-ID. Toate rutele sunt adunate, iar intervalele suprapuse nu sunt numărate de două ori.</p></div>
+<form class="upload" method="post" action="/admin/hours" enctype="multipart/form-data"><input type="file" name="report_file" accept=".xlsx" required><button class="btn btn-dark" type="submit">Verifică orele</button></form></section>
 <div class="file-row"><i></i><div>{file_status}</div></div>
 <section class="controls"><label>Data verificării<select id="dateSelect"></select></label><label>Caută șofer<input id="searchInput" type="search" placeholder="Scrie un nume..."></label><button class="btn btn-light export" id="exportBtn" type="button">Descarcă CSV</button></section>
 <section class="stats"><div class="stat"><div><span>Șoferi verificați</span><small>cu ore reale</small></div><strong id="totalCount">0</strong></div><div class="stat warn"><div><span>Peste 10 ore</span><small>necesită atenție</small></div><strong id="warningCount">0</strong></div><div class="stat critical"><div><span>10h 30m sau mai mult</span><small>limită critică</small></div><strong id="criticalCount">0</strong></div></section>
