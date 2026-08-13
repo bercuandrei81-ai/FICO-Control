@@ -81,15 +81,18 @@ class SmartSequenceMatcher(_ORIGINAL_SEQUENCE_MATCHER):
 
 _difflib.SequenceMatcher = SmartSequenceMatcher
 
-# Render often starts from /backend, so this startup hook must also patch the
-# HTMLResponse used by app_mobile_api. The score button is inserted immediately
-# after Mentor Check on the Admin Dashboard.
+# Render often starts from /backend. Patch every HTMLResponse so the Score
+# Verification entry appears in the dashboard side menu and in module top bars.
 try:
     from starlette.responses import HTMLResponse as _HTMLResponse
     _ORIGINAL_HTML_RESPONSE_INIT = _HTMLResponse.__init__
 
-    def _fico_html_response_init(self, content=None, *args, **kwargs):
-        if isinstance(content, str) and 'side-nav-links' in content and '/admin/score-check' not in content:
+    def _inject_score_link(content: str) -> str:
+        if '/admin/score-check' in content:
+            return content
+
+        # Main Admin Dashboard left menu: insert after Mentor Check.
+        if 'side-nav-links' in content:
             marker = '<a class="side-link" href="/admin/mentor?d='
             start = content.find(marker)
             if start != -1:
@@ -98,6 +101,43 @@ try:
                     end += 4
                     button = '\n        <a class="side-link" href="/admin/score-check"><i></i>Verificare Scor</a>'
                     content = content[:end] + button + content[end:]
+                    return content
+
+        # Mentor Check top navigation.
+        mentor_marker = '<a class="btn btn-light" href="/admin/hours">Control ore</a>'
+        if mentor_marker in content:
+            score_button = '<a class="btn btn-light" href="/admin/score-check">Verificare Scor</a>'
+            return content.replace(mentor_marker, score_button + mentor_marker, 1)
+
+        # Hours page top navigation.
+        hours_marker = '<a class="btn btn-light" href="/admin/pod-ccc">POD & CCC</a>'
+        if 'Control ore șoferi' in content and hours_marker in content:
+            score_button = '<a class="btn btn-light" href="/admin/score-check">Verificare Scor</a>'
+            return content.replace(hours_marker, score_button + hours_marker, 1)
+
+        # POD & CCC navigation.
+        pod_marker = '<a class="pc-btn" href="/admin/hours">Control ore</a>'
+        if 'POD & CCC' in content and pod_marker in content:
+            score_button = '<a class="pc-btn" href="/admin/score-check">Verificare Scor</a>'
+            return content.replace(pod_marker, score_button + pod_marker, 1)
+
+        # Concessions navigation.
+        concessions_marker = '<a class="cn-btn" href="/admin/pod-ccc">POD & CCC</a>'
+        if '<h1>Concesii</h1>' in content and concessions_marker in content:
+            score_button = '<a class="cn-btn" href="/admin/score-check">Verificare Scor</a>'
+            return content.replace(concessions_marker, score_button + concessions_marker, 1)
+
+        # Atlas navigation.
+        atlas_marker = '<a\n        class="atlas-btn"\n        href="/admin/hours"\n      >Control ore</a>'
+        if '<h1>Atlas Paket</h1>' in content and atlas_marker in content:
+            score_button = '<a class="atlas-btn" href="/admin/score-check">Verificare Scor</a>'
+            return content.replace(atlas_marker, score_button + atlas_marker, 1)
+
+        return content
+
+    def _fico_html_response_init(self, content=None, *args, **kwargs):
+        if isinstance(content, str):
+            content = _inject_score_link(content)
         _ORIGINAL_HTML_RESPONSE_INIT(self, content, *args, **kwargs)
 
     if not getattr(_HTMLResponse, '_fico_score_button_patched', False):
