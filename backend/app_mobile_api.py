@@ -7209,3 +7209,130 @@ print(
     "ATLAS_PAKET_V5_OCR_RETRY_LOADED",
     flush=True,
 )
+# ============================================================================
+# ATLAS PAKET V6 - TWO SEPARATE PAGE INPUTS
+# PASTE THIS BLOCK AT THE VERY END OF backend/app_mobile_api.py
+# ============================================================================
+
+_ATLAS_V6_ORIGINAL_PAGE_HTML = atlas_page_html
+_ATLAS_V6_ORIGINAL_BUILD_ASSIGNMENTS = atlas_build_assignments
+
+
+def _atlas_v6_page_html(assignments=None, review=None, error=""):
+    page = _ATLAS_V6_ORIGINAL_PAGE_HTML(assignments, review, error)
+
+    old_block_1 = '''<input
+          id="atlasImagesInput"
+          type="file"
+          name="atlas_images"
+          accept="image/jpeg,image/png,image/webp"
+          multiple
+          required
+        >'''
+
+    old_block_2 = '''<input
+          type="file"
+          name="atlas_images"
+          accept="image/jpeg,image/png,image/webp"
+          multiple
+          required
+        >'''
+
+    new_block = '''<div style="display:grid;gap:9px">
+          <div>
+            <div style="font-size:12px;font-weight:900;margin-bottom:5px">Pagina 1 Atlas</div>
+            <input id="atlasPage1" type="file" name="atlas_images"
+                   accept="image/jpeg,image/png,image/webp" required>
+          </div>
+          <div>
+            <div style="font-size:12px;font-weight:900;margin-bottom:5px">Pagina 2 Atlas</div>
+            <input id="atlasPage2" type="file" name="atlas_images"
+                   accept="image/jpeg,image/png,image/webp" required>
+          </div>
+          <div id="atlasPagesSelected"
+               style="padding:8px 10px;border-radius:8px;background:#fff4d6;
+                      color:#8a5a00;font-size:12px;font-weight:900">
+            Selectează separat Page 1 și Page 2
+          </div>
+        </div>'''
+
+    if old_block_1 in page:
+        page = page.replace(old_block_1, new_block, 1)
+    elif old_block_2 in page:
+        page = page.replace(old_block_2, new_block, 1)
+
+    script = r'''
+<script>
+(() => {
+  const old = document.getElementById('atlasSelectedFiles');
+  if (old) old.remove();
+
+  const page1 = document.getElementById('atlasPage1');
+  const page2 = document.getElementById('atlasPage2');
+  const box = document.getElementById('atlasPagesSelected');
+  if (!page1 || !page2 || !box) return;
+
+  function refresh() {
+    const f1 = page1.files && page1.files[0];
+    const f2 = page2.files && page2.files[0];
+
+    if (f1 && f2) {
+      box.textContent = '2/2 pagini selectate: ' + f1.name + ' · ' + f2.name;
+      box.style.background = '#e9f8ef';
+      box.style.color = '#147a42';
+    } else if (f1 || f2) {
+      box.textContent = '1/2 pagini selectate · mai selectează încă o pagină';
+      box.style.background = '#fff4d6';
+      box.style.color = '#8a5a00';
+    } else {
+      box.textContent = 'Selectează separat Page 1 și Page 2';
+      box.style.background = '#fff4d6';
+      box.style.color = '#8a5a00';
+    }
+  }
+
+  page1.addEventListener('change', refresh);
+  page2.addEventListener('change', refresh);
+  refresh();
+})();
+</script>
+'''
+    page = page.replace("</body>", script + "</body>", 1)
+
+    marker = (
+        '<div style="margin-top:6px;font-size:11px;font-weight:900;color:#d5edf3">'
+        'Atlas V6 activ · Page 1 și Page 2 se încarcă separat'
+        '</div>'
+    )
+
+    if "Atlas V6 activ" not in page:
+        page = page.replace(
+            "Atlas OCR V5 activ · verificare pe fiecare poză + retry automat",
+            "Atlas OCR V5 activ · verificare pe fiecare poză + retry automat" + marker,
+            1,
+        )
+
+    return page
+
+
+def _atlas_v6_build_assignments(cortex_routes, pages):
+    assignments, review = _ATLAS_V6_ORIGINAL_BUILD_ASSIGNMENTS(cortex_routes, pages)
+
+    if len(pages) < 2:
+        review.append({
+            "file": "Atlas",
+            "route": "—",
+            "tracking": "—",
+            "reason": (
+                f"UPLOAD INCOMPLET: serverul a primit doar {len(pages)} "
+                "pagină/pagini Atlas din 2."
+            ),
+        })
+
+    return assignments, review
+
+
+atlas_page_html = _atlas_v6_page_html
+atlas_build_assignments = _atlas_v6_build_assignments
+
+print("ATLAS_PAKET_V6_SEPARATE_UPLOADS_LOADED", flush=True)
