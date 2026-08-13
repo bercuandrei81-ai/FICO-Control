@@ -94,7 +94,12 @@ def storage_backend_name():
 
 
 app = FastAPI(title="FICO Control")
+try:
+    from score_check import register_score_check
+except ImportError:
+    from backend.score_check import register_score_check
 
+register_score_check(app)
 HOURS_MAX_UPLOAD_BYTES = 15 * 1024 * 1024
 HOURS_MAX_CSV_BYTES = 12 * 1024 * 1024
 BERLIN_TZ = ZoneInfo("Europe/Berlin")
