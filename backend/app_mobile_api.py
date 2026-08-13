@@ -4845,6 +4845,7 @@ th{{font-size:13px;color:#667085;text-transform:uppercase;letter-spacing:.4px}}
     <div class="side-brand">INSTRUMENTE FICO</div>
     <nav class="side-nav-links">
         <a class="side-link" href="/admin/mentor?d={selected}"><i></i>Mentor Check</a>
+        <a class="side-link" href="/admin/score-check"><i></i>Verificare Scor</a>
         <a class="side-link" href="/admin/hours"><i></i>Control ore</a>
         <a class="side-link" href="/admin/pod-ccc"><i></i>POD & CCC</a>
         <a class="side-link" href="/admin/concessions"><i></i>Concesii</a>
