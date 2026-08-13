@@ -6854,3 +6854,358 @@ print(
     "ATLAS_PAKET_V4_DIRECT_PATCH_LOADED",
     flush=True,
 )
+
+
+# ============================================================================
+# ATLAS PAKET V5 - PER-IMAGE OCR DIAGNOSTICS + RETRY
+# PASTE THIS BLOCK AT THE VERY END OF backend/app_mobile_api.py
+# ============================================================================
+
+_ATLAS_V5_ORIGINAL_OCR_PAGE = atlas_ocr_page
+_ATLAS_V5_ORIGINAL_BUILD_ASSIGNMENTS = atlas_build_assignments
+_ATLAS_V5_ORIGINAL_PAGE_HTML = atlas_page_html
+
+
+def _atlas_v5_count_tracking_from_page(page):
+    ids = set()
+
+    for line in page.get("lines") or []:
+        text = str(line.get("text") or "")
+        for tracking in atlas_tracking_ids_from_text(text):
+            ids.add(tracking)
+
+    for raw_line in str(page.get("text") or "").splitlines():
+        for tracking in atlas_tracking_ids_from_text(raw_line):
+            ids.add(tracking)
+
+    return sorted(ids)
+
+
+def _atlas_v5_ocr_request(raw, content_type, filename, upload_index, *, engine="2", table=True):
+    api_key = os.getenv("OCRSPACE_API_KEY", "").strip()
+
+    if not api_key:
+        raise ValueError(
+            "OCRSPACE_API_KEY nu este configurat în Render. "
+            "Atlas Paket are nevoie de OCR pentru a citi pozele Amazon."
+        )
+
+    boundary = "----AtlasPaketV5Boundary7MA4YWxkTrZu0gW"
+
+    extension = "jpg"
+    if content_type == "image/png":
+        extension = "png"
+    elif content_type == "image/webp":
+        extension = "webp"
+
+    parts = []
+
+    def add_field(name, value):
+        parts.append(
+            (
+                f"--{boundary}\r\n"
+                f'Content-Disposition: form-data; name="{name}"\r\n\r\n'
+                f"{value}\r\n"
+            ).encode("utf-8")
+        )
+
+    add_field("apikey", api_key)
+    add_field("language", "eng")
+    add_field("isOverlayRequired", "true")
+    add_field("isTable", "true" if table else "false")
+    add_field("OCREngine", str(engine))
+    add_field("scale", "true")
+    add_field("detectOrientation", "true")
+
+    parts.append(
+        (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="file"; '
+            f'filename="atlas.{extension}"\r\n'
+            f"Content-Type: {content_type}\r\n\r\n"
+        ).encode("utf-8")
+        + raw
+        + b"\r\n"
+    )
+
+    parts.append(
+        f"--{boundary}--\r\n".encode("utf-8")
+    )
+
+    request = urllib.request.Request(
+        "https://api.ocr.space/parse/image",
+        data=b"".join(parts),
+        headers={
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+            "User-Agent": "FICO-Control-Atlas/5.0",
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=45) as response:
+            payload = json.loads(
+                response.read().decode("utf-8", errors="replace")
+            )
+    except Exception as exc:
+        raise ValueError(
+            f"OCR-ul nu a putut citi poza {filename}."
+        ) from exc
+
+    if payload.get("IsErroredOnProcessing"):
+        message = (
+            payload.get("ErrorMessage")
+            or payload.get("ErrorDetails")
+        )
+
+        if isinstance(message, list):
+            message = " ".join(str(item) for item in message)
+
+        raise ValueError(
+            f"OCR Atlas pentru {filename}: "
+            + str(message or "eroare necunoscută")
+        )
+
+    parsed_results = payload.get("ParsedResults") or []
+
+    if not parsed_results:
+        raise ValueError(
+            f"Poza {filename} nu a produs niciun rezultat OCR."
+        )
+
+    parsed_text_parts = []
+    line_records = []
+    synthetic_top = 0.0
+
+    for result in parsed_results:
+        parsed_text = str(result.get("ParsedText") or "")
+        if parsed_text:
+            parsed_text_parts.append(parsed_text)
+
+        overlay = result.get("TextOverlay") or {}
+        overlay_lines = overlay.get("Lines") or []
+
+        for line in overlay_lines:
+            words = line.get("Words") or []
+            line_text = str(
+                line.get("LineText") or ""
+            ).strip()
+
+            if not line_text and words:
+                line_text = " ".join(
+                    str(
+                        word.get("WordText") or ""
+                    ).strip()
+                    for word in words
+                    if str(
+                        word.get("WordText") or ""
+                    ).strip()
+                )
+
+            if not line_text:
+                continue
+
+            top = line.get("MinTop")
+            if top is None and words:
+                top = min(
+                    float(word.get("Top") or 0)
+                    for word in words
+                )
+
+            if top is None:
+                top = synthetic_top
+
+            left = 0.0
+            if words:
+                left = min(
+                    float(word.get("Left") or 0)
+                    for word in words
+                )
+
+            height = line.get("MaxHeight")
+
+            if height is None and words:
+                height = max(
+                    float(word.get("Height") or 0)
+                    for word in words
+                )
+
+            if not height:
+                height = 12.0
+
+            line_records.append({
+                "text": line_text,
+                "top": float(top),
+                "left": float(left),
+                "height": float(height),
+            })
+
+            synthetic_top = max(
+                synthetic_top + 18.0,
+                float(top)
+                + float(height)
+                + 3.0,
+            )
+
+    combined_text = "\n".join(
+        parsed_text_parts
+    ).strip()
+
+    if not line_records:
+        for line_number, line_text in enumerate(
+            combined_text.splitlines()
+        ):
+            line_text = line_text.strip()
+
+            if not line_text:
+                continue
+
+            line_records.append({
+                "text": line_text,
+                "top": float(line_number * 22),
+                "left": 0.0,
+                "height": 14.0,
+            })
+
+    page_number = None
+    page_total = None
+
+    page_match = re.search(
+        r"\bPAGE\s*(\d+)\s*(?:OF|/)\s*(\d+)\b",
+        combined_text,
+        flags=re.IGNORECASE,
+    )
+
+    if page_match:
+        page_number = int(page_match.group(1))
+        page_total = int(page_match.group(2))
+
+    return {
+        "filename": filename,
+        "upload_index": upload_index,
+        "page_number": page_number,
+        "page_total": page_total,
+        "text": combined_text,
+        "lines": line_records,
+        "ocr_engine": str(engine),
+        "ocr_table": bool(table),
+    }
+
+
+def _atlas_v5_ocr_page(raw, content_type, filename, upload_index):
+    """
+    First pass: existing OCR logic.
+    Retry automatically if the first pass reads too few tracking IDs.
+    """
+    first = _ATLAS_V5_ORIGINAL_OCR_PAGE(
+        raw,
+        content_type,
+        filename,
+        upload_index,
+    )
+
+    first_ids = _atlas_v5_count_tracking_from_page(first)
+
+    # If page looks healthy, keep it.
+    if len(first_ids) >= 2:
+        first["tracking_count"] = len(first_ids)
+        first["ocr_attempts"] = 1
+        first["ocr_retry_used"] = False
+        return first
+
+    # Retry with alternate OCR mode.
+    try:
+        second = _atlas_v5_ocr_request(
+            raw,
+            content_type,
+            filename,
+            upload_index,
+            engine="1",
+            table=False,
+        )
+        second_ids = _atlas_v5_count_tracking_from_page(second)
+
+        if len(second_ids) > len(first_ids):
+            second["tracking_count"] = len(second_ids)
+            second["ocr_attempts"] = 2
+            second["ocr_retry_used"] = True
+            return second
+    except Exception as exc:
+        print(
+            "ATLAS_V5_RETRY_ERROR:",
+            filename,
+            type(exc).__name__,
+            str(exc)[:300],
+            flush=True,
+        )
+
+    first["tracking_count"] = len(first_ids)
+    first["ocr_attempts"] = 2
+    first["ocr_retry_used"] = True
+    return first
+
+
+def _atlas_v5_build_assignments(cortex_routes, pages):
+    assignments, review = _ATLAS_V5_ORIGINAL_BUILD_ASSIGNMENTS(
+        cortex_routes,
+        pages,
+    )
+
+    # Per-image diagnostics.
+    for page in sorted(
+        pages,
+        key=lambda item: item.get("upload_index", 0),
+    ):
+        count = page.get("tracking_count")
+        if count is None:
+            count = len(
+                _atlas_v5_count_tracking_from_page(page)
+            )
+
+        if count == 0:
+            review.append({
+                "file": page.get("filename") or "Atlas",
+                "route": "—",
+                "tracking": "—",
+                "reason": (
+                    "OCR PAGINĂ: această poză a produs 0 Tracking ID-uri. "
+                    "Sistemul a încercat automat și a doua metodă OCR."
+                ),
+            })
+
+    return assignments, review
+
+
+def _atlas_v5_page_html(assignments=None, review=None, error=""):
+    page = _ATLAS_V5_ORIGINAL_PAGE_HTML(
+        assignments,
+        review,
+        error,
+    )
+
+    # Add V5 marker so we can visually confirm this patch is active.
+    marker = (
+        '<div style="margin-top:8px;font-size:11px;'
+        'font-weight:900;color:#d5edf3">'
+        'Atlas OCR V5 activ · verificare pe fiecare poză + retry automat'
+        '</div>'
+    )
+
+    page = page.replace(
+        "</p>",
+        "</p>" + marker,
+        1,
+    )
+
+    return page
+
+
+# Replace live functions.
+atlas_ocr_page = _atlas_v5_ocr_page
+atlas_build_assignments = _atlas_v5_build_assignments
+atlas_page_html = _atlas_v5_page_html
+
+print(
+    "ATLAS_PAKET_V5_OCR_RETRY_LOADED",
+    flush=True,
+)
