@@ -1,13 +1,4 @@
-"""Safer Cortex <-> Mentor name matching for FICO Control.
-
-Python loads sitecustomize automatically at interpreter startup. This patch
-improves difflib.SequenceMatcher only for name-like strings, while leaving all
-other comparisons unchanged.
-
-It also guarantees that the separate Verificare Scor module is registered even
-when Render starts Uvicorn directly from the backend directory (for example
-``uvicorn app_mobile_api:app``), where backend/__init__.py is not imported.
-"""
+"""Safer Cortex <-> Mentor name matching for FICO Control."""
 
 import re
 import unicodedata
@@ -24,11 +15,7 @@ def _normalize_token(value: str) -> str:
 
 
 def _tokenize(value: str) -> list[str]:
-    return [
-        token
-        for token in (_normalize_token(part) for part in str(value or "").split())
-        if token
-    ]
+    return [token for token in (_normalize_token(part) for part in str(value or "").split()) if token]
 
 
 def _token_match(a: str, b: str) -> bool:
@@ -52,15 +39,12 @@ def _name_token_score(a: str, b: str) -> float:
     right = _tokenize(b)
     if not left or not right:
         return 0.0
-
     used = set()
     matched = 0
     exact = 0
-
     for token in left:
         best_index = None
         best_exact = False
-
         for index, candidate in enumerate(right):
             if index in used:
                 continue
@@ -69,58 +53,62 @@ def _name_token_score(a: str, b: str) -> float:
                 best_exact = token == candidate
                 if best_exact:
                     break
-
         if best_index is not None:
             used.add(best_index)
             matched += 1
             if best_exact:
                 exact += 1
-
     smaller = min(len(left), len(right))
     larger = max(len(left), len(right))
-
-    # Strong match when all tokens from the shorter name are present in the
-    # longer name. This handles missing middle names and reversed order.
     if smaller >= 2 and matched == smaller:
         coverage_penalty = min(0.08, 0.025 * (larger - smaller))
         exact_bonus = 0.02 * (exact / smaller)
         return min(0.98, 0.94 - coverage_penalty + exact_bonus)
-
-    # One-token overlaps remain uncertain and should not become automatic
-    # green matches in Mentor Check.
     if matched == 1:
         return 0.66 if smaller == 1 else 0.58
-
     return 0.0
 
 
 class SmartSequenceMatcher(_ORIGINAL_SEQUENCE_MATCHER):
     def ratio(self):
         base = super().ratio()
-        a = self.a
-        b = self.b
-
-        if isinstance(a, str) and isinstance(b, str):
-            smart = _name_token_score(a, b)
+        if isinstance(self.a, str) and isinstance(self.b, str):
+            smart = _name_token_score(self.a, self.b)
             if smart:
                 return max(base, smart)
-
         return base
 
 
 _difflib.SequenceMatcher = SmartSequenceMatcher
 
+# Render often starts from /backend, so this startup hook must also patch the
+# HTMLResponse used by app_mobile_api. The score button is inserted immediately
+# after Mentor Check on the Admin Dashboard.
+try:
+    from starlette.responses import HTMLResponse as _HTMLResponse
+    _ORIGINAL_HTML_RESPONSE_INIT = _HTMLResponse.__init__
 
-# ---------------------------------------------------------------------------
-# FICO Control startup integration
-# ---------------------------------------------------------------------------
-# Render may use the backend directory as its working directory and import the
-# application as ``app_mobile_api:app``. In that mode backend/__init__.py is not
-# involved. Patch FastAPI construction once at interpreter startup so the score
-# verification router is registered on the actual application instance.
+    def _fico_html_response_init(self, content=None, *args, **kwargs):
+        if isinstance(content, str) and 'side-nav-links' in content and '/admin/score-check' not in content:
+            marker = '<a class="side-link" href="/admin/mentor?d='
+            start = content.find(marker)
+            if start != -1:
+                end = content.find('</a>', start)
+                if end != -1:
+                    end += 4
+                    button = '\n        <a class="side-link" href="/admin/score-check"><i></i>Verificare Scor</a>'
+                    content = content[:end] + button + content[end:]
+        _ORIGINAL_HTML_RESPONSE_INIT(self, content, *args, **kwargs)
+
+    if not getattr(_HTMLResponse, '_fico_score_button_patched', False):
+        _HTMLResponse.__init__ = _fico_html_response_init
+        _HTMLResponse._fico_score_button_patched = True
+except Exception as exc:
+    print('SCORE_CHECK_HTML_PATCH_ERROR:', type(exc).__name__, str(exc)[:500], flush=True)
+
+# Register score routes on every FastAPI app created after this hook loads.
 try:
     from fastapi import FastAPI as _FastAPI
-
     _ORIGINAL_FASTAPI_INIT = _FastAPI.__init__
 
     def _fico_fastapi_init(self, *args, **kwargs):
@@ -132,22 +120,10 @@ try:
                 from backend.score_check import register_score_check
             register_score_check(self)
         except Exception as exc:
-            # Do not prevent the main application from starting if this optional
-            # admin module cannot be loaded; the error remains visible in logs.
-            print(
-                "SCORE_CHECK_STARTUP_ERROR:",
-                type(exc).__name__,
-                str(exc)[:500],
-                flush=True,
-            )
+            print('SCORE_CHECK_STARTUP_ERROR:', type(exc).__name__, str(exc)[:500], flush=True)
 
-    if not getattr(_FastAPI, "_fico_score_check_patched", False):
+    if not getattr(_FastAPI, '_fico_score_check_patched', False):
         _FastAPI.__init__ = _fico_fastapi_init
         _FastAPI._fico_score_check_patched = True
 except Exception as exc:
-    print(
-        "SCORE_CHECK_PATCH_ERROR:",
-        type(exc).__name__,
-        str(exc)[:500],
-        flush=True,
-    )
+    print('SCORE_CHECK_PATCH_ERROR:', type(exc).__name__, str(exc)[:500], flush=True)
