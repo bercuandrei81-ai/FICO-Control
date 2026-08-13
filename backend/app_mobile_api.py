@@ -7336,3 +7336,188 @@ atlas_page_html = _atlas_v6_page_html
 atlas_build_assignments = _atlas_v6_build_assignments
 
 print("ATLAS_PAKET_V6_SEPARATE_UPLOADS_LOADED", flush=True)
+# ============================================================================
+# ATLAS PAKET V7 - FORCE TWO REAL FILE INPUTS IN THE BROWSER
+# PASTE THIS BLOCK AT THE VERY END OF backend/app_mobile_api.py
+# ============================================================================
+
+_ATLAS_V7_ORIGINAL_PAGE_HTML = atlas_page_html
+_ATLAS_V7_ORIGINAL_BUILD_ASSIGNMENTS = atlas_build_assignments
+
+
+def _atlas_v7_page_html(assignments=None, review=None, error=""):
+    page = _ATLAS_V7_ORIGINAL_PAGE_HTML(
+        assignments,
+        review,
+        error,
+    )
+
+    force_two_inputs_script = r"""
+<script>
+(() => {
+  function installAtlasTwoInputs() {
+    const original = document.querySelector('input[name="atlas_images"]');
+    if (!original) return;
+
+    // Already installed.
+    if (document.getElementById('atlasPage1V7')) return;
+
+    const wrapper = document.createElement('div');
+    wrapper.id = 'atlasV7Inputs';
+    wrapper.style.cssText = 'display:grid;gap:10px;margin-top:4px';
+
+    wrapper.innerHTML = `
+      <div>
+        <div style="font-size:12px;font-weight:900;margin-bottom:5px">
+          Pagina 1 Atlas
+        </div>
+        <input
+          id="atlasPage1V7"
+          type="file"
+          name="atlas_images"
+          accept="image/jpeg,image/png,image/webp"
+          required
+        >
+      </div>
+
+      <div>
+        <div style="font-size:12px;font-weight:900;margin-bottom:5px">
+          Pagina 2 Atlas
+        </div>
+        <input
+          id="atlasPage2V7"
+          type="file"
+          name="atlas_images"
+          accept="image/jpeg,image/png,image/webp"
+          required
+        >
+      </div>
+
+      <div
+        id="atlasV7Status"
+        style="padding:8px 10px;border-radius:8px;background:#fff4d6;
+               color:#8a5a00;font-size:12px;font-weight:900;line-height:1.4"
+      >
+        0/2 pagini selectate
+      </div>
+    `;
+
+    original.insertAdjacentElement('beforebegin', wrapper);
+
+    // Remove the old multi-file input completely so only the two V7 inputs
+    // are submitted to FastAPI.
+    original.remove();
+
+    // Remove old helper boxes from V4/V5/V6 if present.
+    [
+      'atlasSelectedFiles',
+      'atlasPagesSelected'
+    ].forEach(id => {
+      const el = document.getElementById(id);
+      if (el) el.remove();
+    });
+
+    const p1 = document.getElementById('atlasPage1V7');
+    const p2 = document.getElementById('atlasPage2V7');
+    const status = document.getElementById('atlasV7Status');
+
+    function refresh() {
+      const f1 = p1.files && p1.files[0];
+      const f2 = p2.files && p2.files[0];
+
+      if (f1 && f2) {
+        status.textContent =
+          '2/2 pagini selectate: ' + f1.name + ' · ' + f2.name;
+        status.style.background = '#e9f8ef';
+        status.style.color = '#147a42';
+      } else if (f1 || f2) {
+        status.textContent = '1/2 pagini selectate';
+        status.style.background = '#fff4d6';
+        status.style.color = '#8a5a00';
+      } else {
+        status.textContent = '0/2 pagini selectate';
+        status.style.background = '#fff4d6';
+        status.style.color = '#8a5a00';
+      }
+    }
+
+    p1.addEventListener('change', refresh);
+    p2.addEventListener('change', refresh);
+    refresh();
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', installAtlasTwoInputs);
+  } else {
+    installAtlasTwoInputs();
+  }
+})();
+</script>
+"""
+
+    page = page.replace(
+        "</body>",
+        force_two_inputs_script + "</body>",
+        1,
+    )
+
+    marker = (
+        '<div style="margin-top:6px;font-size:11px;font-weight:900;color:#d5edf3">'
+        'Atlas V7 activ · două upload-uri reale, separate'
+        '</div>'
+    )
+
+    if "Atlas V7 activ" not in page:
+        anchor = (
+            "Atlas V6 activ · Page 1 și Page 2 se încarcă separat"
+        )
+        if anchor in page:
+            page = page.replace(
+                anchor,
+                anchor + marker,
+                1,
+            )
+        else:
+            page = page.replace(
+                "</p>",
+                "</p>" + marker,
+                1,
+            )
+
+    return page
+
+
+def _atlas_v7_build_assignments(cortex_routes, pages):
+    assignments, review = _ATLAS_V7_ORIGINAL_BUILD_ASSIGNMENTS(
+        cortex_routes,
+        pages,
+    )
+
+    # Remove older generic "UPLOAD INCOMPLET" rows first so we don't duplicate.
+    review = [
+        item for item in review
+        if not str(item.get("reason") or "").startswith("UPLOAD INCOMPLET:")
+    ]
+
+    # Server-side truth: how many actual UploadFile objects made it through OCR.
+    if len(pages) != 2:
+        review.append({
+            "file": "Atlas",
+            "route": "—",
+            "tracking": "—",
+            "reason": (
+                f"UPLOAD V7: serverul a primit {len(pages)} pagină/pagini din 2. "
+                "Folosește cele două câmpuri separate Page 1 și Page 2."
+            ),
+        })
+
+    return assignments, review
+
+
+atlas_page_html = _atlas_v7_page_html
+atlas_build_assignments = _atlas_v7_build_assignments
+
+print(
+    "ATLAS_PAKET_V7_TWO_REAL_INPUTS_LOADED",
+    flush=True,
+)
