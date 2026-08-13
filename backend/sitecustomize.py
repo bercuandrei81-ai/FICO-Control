@@ -3,6 +3,10 @@
 Python loads sitecustomize automatically at interpreter startup. This patch
 improves difflib.SequenceMatcher only for name-like strings, while leaving all
 other comparisons unchanged.
+
+It also guarantees that the separate Verificare Scor module is registered even
+when Render starts Uvicorn directly from the backend directory (for example
+``uvicorn app_mobile_api:app``), where backend/__init__.py is not imported.
 """
 
 import re
@@ -105,3 +109,45 @@ class SmartSequenceMatcher(_ORIGINAL_SEQUENCE_MATCHER):
 
 
 _difflib.SequenceMatcher = SmartSequenceMatcher
+
+
+# ---------------------------------------------------------------------------
+# FICO Control startup integration
+# ---------------------------------------------------------------------------
+# Render may use the backend directory as its working directory and import the
+# application as ``app_mobile_api:app``. In that mode backend/__init__.py is not
+# involved. Patch FastAPI construction once at interpreter startup so the score
+# verification router is registered on the actual application instance.
+try:
+    from fastapi import FastAPI as _FastAPI
+
+    _ORIGINAL_FASTAPI_INIT = _FastAPI.__init__
+
+    def _fico_fastapi_init(self, *args, **kwargs):
+        _ORIGINAL_FASTAPI_INIT(self, *args, **kwargs)
+        try:
+            try:
+                from score_check import register_score_check
+            except ImportError:
+                from backend.score_check import register_score_check
+            register_score_check(self)
+        except Exception as exc:
+            # Do not prevent the main application from starting if this optional
+            # admin module cannot be loaded; the error remains visible in logs.
+            print(
+                "SCORE_CHECK_STARTUP_ERROR:",
+                type(exc).__name__,
+                str(exc)[:500],
+                flush=True,
+            )
+
+    if not getattr(_FastAPI, "_fico_score_check_patched", False):
+        _FastAPI.__init__ = _fico_fastapi_init
+        _FastAPI._fico_score_check_patched = True
+except Exception as exc:
+    print(
+        "SCORE_CHECK_PATCH_ERROR:",
+        type(exc).__name__,
+        str(exc)[:500],
+        flush=True,
+    )
