@@ -1,3 +1,6 @@
-"""Load FICO Control startup customizations from the repository root."""
+"""Repository-level Python startup hook.
 
-from backend import sitecustomize as _fico_sitecustomize  # noqa: F401
+FICO Control customizations are loaded from backend.__init__ when the backend
+package is imported. Keeping this root hook lightweight avoids initializing the
+web application during unrelated Python startup commands.
+"""
