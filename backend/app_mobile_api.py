@@ -6453,3 +6453,404 @@ async def atlas_paket_generate(
 
         for image in atlas_images or []:
             await image.close()
+# ============================================================================
+# ATLAS PAKET V4 - MULTI-PAGE + TOTAL PACKAGES VALIDATION
+# PASTE THIS BLOCK AT THE VERY END OF backend/app_mobile_api.py
+# ============================================================================
+
+_ATLAS_V4_ORIGINAL_BUILD_ASSIGNMENTS = atlas_build_assignments
+_ATLAS_V4_ORIGINAL_PAGE_HTML = atlas_page_html
+
+
+def _atlas_v4_expected_total(text):
+    """
+    Detect Amazon totals such as:
+      Total: 28 packages
+      Total Packages: 28
+      Total 28 Packages
+    """
+    upper = str(text or "").upper()
+
+    patterns = (
+        r"\bTOTAL\s*PACKAGES?\s*[:\-]?\s*(\d{1,4})\b",
+        r"\bTOTAL\s*[:\-]?\s*(\d{1,4})\s*PACKAGES?\b",
+        r"\bTOTAL\s+(\d{1,4})\s*PACKAGES?\b",
+    )
+
+    for pattern in patterns:
+        match = re.search(pattern, upper)
+        if match:
+            try:
+                return int(match.group(1))
+            except (TypeError, ValueError):
+                pass
+
+    return None
+
+
+def _atlas_v4_page_info(text):
+    """
+    Detect:
+      Page 1 of 2
+      Page 1/2
+    """
+    match = re.search(
+        r"\bPAGE\s*(\d+)\s*(?:OF|/)\s*(\d+)\b",
+        str(text or ""),
+        flags=re.IGNORECASE,
+    )
+
+    if not match:
+        return None, None
+
+    try:
+        return int(match.group(1)), int(match.group(2))
+    except (TypeError, ValueError):
+        return None, None
+
+
+def _atlas_v4_build_assignments(cortex_routes, pages):
+    """
+    V4:
+    1. keeps the existing Atlas logic;
+    2. additionally scans ParsedText line-by-line so tracking IDs missed by
+       OCR overlay can still be recovered;
+    3. preserves current_route between Page 1 and Page 2;
+    4. validates Page X of Y;
+    5. validates Amazon Total packages against all detected tracking IDs.
+    """
+    assignments, review = _ATLAS_V4_ORIGINAL_BUILD_ASSIGNMENTS(
+        cortex_routes,
+        pages,
+    )
+
+    pages_sorted = sorted(
+        pages,
+        key=lambda page: (
+            page.get("page_number") is None,
+            (
+                page.get("page_number")
+                if page.get("page_number") is not None
+                else page.get("upload_index", 0)
+            ),
+            page.get("upload_index", 0),
+        ),
+    )
+
+    # Everything already recognized by V2/V3.
+    seen_tracking = {
+        item.get("tracking")
+        for item in assignments
+        if item.get("tracking") and item.get("tracking") != "—"
+    }
+
+    # IMPORTANT:
+    # Do not put review tracking IDs in seen_tracking here.
+    # ParsedText fallback may be able to recover a route for an item that the
+    # overlay parser could not safely assign.
+    current_route = None
+
+    for page in pages_sorted:
+        filename = page.get("filename") or "Atlas"
+        page_text = str(page.get("text") or "")
+
+        # ParsedText has a stable top-to-bottom order and often contains rows
+        # that OCR overlay failed to expose correctly.
+        for raw_line in page_text.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+
+            row_routes = atlas_route_codes_from_text(line)
+
+            if row_routes:
+                unique_routes = list(dict.fromkeys(row_routes))
+                cortex_candidates = [
+                    route
+                    for route in unique_routes
+                    if route in cortex_routes
+                ]
+
+                if len(cortex_candidates) == 1:
+                    current_route = cortex_candidates[0]
+                elif len(unique_routes) == 1:
+                    current_route = unique_routes[0]
+                else:
+                    # Ambiguous row: do not guess.
+                    current_route = None
+
+            row_tracking_ids = atlas_tracking_ids_from_text(line)
+
+            for tracking_id in row_tracking_ids:
+                if tracking_id in seen_tracking:
+                    continue
+
+                if not current_route:
+                    # Keep it for manual review rather than silently losing it.
+                    if not any(
+                        item.get("tracking") == tracking_id
+                        for item in review
+                    ):
+                        review.append({
+                            "file": filename,
+                            "route": "—",
+                            "tracking": tracking_id,
+                            "reason": (
+                                "Tracking ID citit, dar ruta nu a putut fi "
+                                "identificată sigur"
+                            ),
+                        })
+                    continue
+
+                if current_route not in cortex_routes:
+                    if not any(
+                        item.get("tracking") == tracking_id
+                        for item in review
+                    ):
+                        review.append({
+                            "file": filename,
+                            "route": current_route,
+                            "tracking": tracking_id,
+                            "reason": "Ruta nu există în Excelul Cortex",
+                        })
+                    continue
+
+                # If the original parser placed this tracking in review,
+                # remove that review row now because V4 recovered it.
+                review = [
+                    item
+                    for item in review
+                    if item.get("tracking") != tracking_id
+                ]
+
+                assignments.append({
+                    "driver": cortex_routes[current_route],
+                    "route": current_route,
+                    "tracking": tracking_id,
+                    "file": filename,
+                })
+                seen_tracking.add(tracking_id)
+
+    # De-duplicate assignments safely by Tracking ID.
+    unique_assignments = {}
+    for item in assignments:
+        tracking_id = item.get("tracking")
+        if not tracking_id:
+            continue
+        unique_assignments.setdefault(tracking_id, item)
+
+    assignments = list(unique_assignments.values())
+
+    assignments.sort(
+        key=lambda item: (
+            item["driver"].casefold(),
+            item["route"],
+            item["tracking"],
+        )
+    )
+
+    # ------------------------------------------------------------------
+    # PAGE COVERAGE CHECK
+    # ------------------------------------------------------------------
+    page_info = []
+
+    for page in pages_sorted:
+        page_number = page.get("page_number")
+        page_total = page.get("page_total")
+
+        if page_number is None or page_total is None:
+            page_number, page_total = _atlas_v4_page_info(
+                page.get("text")
+            )
+
+        if page_number is not None and page_total is not None:
+            page_info.append((page_number, page_total))
+
+    if page_info:
+        expected_page_total = max(total for _, total in page_info)
+        received_pages = {
+            number
+            for number, _ in page_info
+        }
+
+        missing_pages = [
+            number
+            for number in range(1, expected_page_total + 1)
+            if number not in received_pages
+        ]
+
+        if missing_pages:
+            review.append({
+                "file": "Atlas",
+                "route": "—",
+                "tracking": "—",
+                "reason": (
+                    "LIPSESC PAGINI ATLAS: "
+                    + ", ".join(str(number) for number in missing_pages)
+                    + f" din {expected_page_total}. "
+                    "Selectează toate paginile în aceeași încărcare."
+                ),
+            })
+
+    # ------------------------------------------------------------------
+    # AMAZON TOTAL PACKAGES CHECK
+    # ------------------------------------------------------------------
+    expected_totals = []
+
+    for page in pages_sorted:
+        value = _atlas_v4_expected_total(page.get("text"))
+        if value:
+            expected_totals.append(value)
+
+    expected_total = (
+        max(expected_totals)
+        if expected_totals
+        else None
+    )
+
+    all_detected_ids = {
+        item.get("tracking")
+        for item in assignments
+        if item.get("tracking") and item.get("tracking") != "—"
+    }
+
+    all_detected_ids.update(
+        item.get("tracking")
+        for item in review
+        if item.get("tracking") and item.get("tracking") != "—"
+    )
+
+    detected_total = len(all_detected_ids)
+
+    if expected_total is not None and detected_total != expected_total:
+        difference = expected_total - detected_total
+
+        if difference > 0:
+            message = (
+                f"TOTAL INCOMPLET: Amazon arată {expected_total} pachete, "
+                f"dar sistemul a citit {detected_total}. "
+                f"Lipsesc {difference} pachete."
+            )
+        else:
+            message = (
+                f"TOTAL DIFERIT: Amazon arată {expected_total} pachete, "
+                f"dar sistemul a citit {detected_total}. "
+                "Verifică duplicatele OCR."
+            )
+
+        review.append({
+            "file": "Atlas",
+            "route": "—",
+            "tracking": "—",
+            "reason": message,
+        })
+
+    return assignments, review
+
+
+def _atlas_v4_page_html(assignments=None, review=None, error=""):
+    """
+    Adds:
+    - selected-image counter before submit;
+    - strong red warning for missing pages / total mismatch.
+    """
+    assignments = assignments or []
+    review = review or []
+
+    page = _ATLAS_V4_ORIGINAL_PAGE_HTML(
+        assignments,
+        review,
+        error,
+    )
+
+    # Add an ID to the multi-file input.
+    page = page.replace(
+        'name="atlas_images"\n          accept=',
+        'id="atlasImagesInput"\n'
+        '          name="atlas_images"\n'
+        '          accept=',
+        1,
+    )
+
+    # Strong warning above the result cards.
+    important_warnings = [
+        str(item.get("reason") or "")
+        for item in review
+        if (
+            str(item.get("reason") or "").startswith("TOTAL ")
+            or str(item.get("reason") or "").startswith("LIPSESC PAGINI")
+        )
+    ]
+
+    if important_warnings:
+        warning_html = (
+            '<div style="margin:18px 0;padding:17px 19px;'
+            'border-radius:14px;background:#fff0f0;'
+            'border:2px solid #d92d20;color:#b42318;'
+            'font-weight:900;font-size:15px;line-height:1.55">'
+            '⚠ '
+            + "<br>⚠ ".join(
+                html.escape(message)
+                for message in important_warnings
+            )
+            + "</div>"
+        )
+
+        page = page.replace(
+            '<section class="atlas-stats">',
+            warning_html + '<section class="atlas-stats">',
+            1,
+        )
+
+    selection_script = r"""
+<script>
+(() => {
+  const input = document.getElementById('atlasImagesInput');
+  if (!input) return;
+
+  const box = document.createElement('div');
+  box.id = 'atlasSelectedFiles';
+  box.style.cssText =
+    'margin-top:8px;padding:7px 9px;border-radius:8px;'
+    + 'background:#e9f8ef;color:#147a42;'
+    + 'font-size:12px;font-weight:900;line-height:1.45';
+
+  input.insertAdjacentElement('afterend', box);
+
+  function refreshAtlasFiles() {
+    const files = Array.from(input.files || []);
+
+    if (!files.length) {
+      box.textContent = '0 poze Atlas selectate';
+      return;
+    }
+
+    box.textContent =
+      files.length
+      + (files.length === 1 ? ' poză Atlas selectată: ' : ' poze Atlas selectate: ')
+      + files.map(file => file.name).join(' · ');
+  }
+
+  input.addEventListener('change', refreshAtlasFiles);
+  refreshAtlasFiles();
+})();
+</script>
+"""
+
+    page = page.replace(
+        "</body>",
+        selection_script + "</body>",
+        1,
+    )
+
+    return page
+
+
+# Replace the live functions used by the already-registered FastAPI routes.
+atlas_build_assignments = _atlas_v4_build_assignments
+atlas_page_html = _atlas_v4_page_html
+
+print(
+    "ATLAS_PAKET_V4_DIRECT_PATCH_LOADED",
+    flush=True,
+)
